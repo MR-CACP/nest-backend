@@ -42,15 +42,26 @@ $ pnpm run test:e2e
 $ pnpm run test:cov
 ```
 
+## 环境变量约定
+
+- 配置通过 `.env`（基础值）+ `.env.{NODE_ENV}`（环境覆盖）加载，完整模板见 `.env.example`。
+- **`NODE_ENV` 必须由进程环境注入**：`package.json` scripts 已通过 `cross-env` 写入，生产部署由部署平台注入。不要写在 `.env.*` 文件里——加载哪个环境文件本身取决于该变量，属于循环依赖，实际无效。
+- 敏感信息（密钥、密码）不要提交：个人覆盖值放 `.env.local` / `.env.{NODE_ENV}.local`（已 gitignore），生产环境由部署平台直接注入（`process.env` 优先级最高）。
+- **`.env.*` 一律不入库**：`.env.example` 是唯一的提交模板，新成员复制为 `.env` 后按需修改；`.env.development` / `.env.test` 等环境文件同样被 gitignore，其默认值由 `.env.example` 与 Joi schema 的 default 提供。
+
 ## 项目约定
 
 - **路径别名**：`@/` 指向 `src/`，例如 `import { AppModule } from '@/app.module'`。
 - **导入排序**：由 ESLint（`eslint-plugin-simple-import-sort`）自动整理，运行 `pnpm lint` 修复。
-- **测试目录**：所有测试文件统一放在 `test/` 目录下。
+- **测试目录**：所有测试文件统一放在 `test/` 目录下，目录结构与 `src/` 对应。
+- **业务异常约定**：`BusinessException` 固定返回 HTTP 200 + 响应体业务 `code`（国内业务码惯例）。代价是 APM/告警无法按状态码识别失败，且错误响应可能被中间层缓存——接入 CDN 时务必复查。
+- **应用装配**：全局管道/前缀/CORS/helmet/Swagger 统一在 `src/app.setup.ts` 的 `configureApp` 中挂载，`main.ts` 与 e2e 共用；全局过滤器/守卫/拦截器在 `app.module.ts` 的 providers 中注册。
 
 ## 部署
 
 将 NestJS 应用部署到生产环境前，可以参考[官方部署文档](https://docs.nestjs.com/deployment)了解关键步骤与优化建议。
+
+> 注意：构建产物 `dist/main.js` 在运行时会读取项目根目录的 `package.json`（Swagger 版本号），打包制品时请保证 `dist/` 与根 `package.json` 一同发布。
 
 如果需要云端部署平台，可以使用官方的 [Mau](https://mau.nestjs.com)，在 AWS 上部署只需几步：
 

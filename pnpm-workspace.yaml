@@ -1,3 +1,5 @@
+# 依赖构建脚本白名单（有意的供应链策略）：@scarf/scarf 为依赖遥测采集，显式禁用
 allowBuilds:
   '@parcel/watcher': true
+  '@scarf/scarf': false
   unrs-resolver: true

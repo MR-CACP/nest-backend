@@ -1,4 +1,11 @@
 {
   "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // 钉死产物布局：无论输入文件来自哪个目录，输出保持 dist/main.js
+    "rootDir": "src",
+    // 增量缓存放进 dist：nest-cli 的 deleteOutDir 每次构建都会清空它，
+    // 避免根目录残留过期缓存导致 tsc 误判"无变更"而静默不产出（且缓存已 gitignore）
+    "tsBuildInfoFile": "dist/tsconfig.build.tsbuildinfo"
+  },
   "exclude": ["node_modules", "test", "dist", "**/*spec.ts"]
 }
