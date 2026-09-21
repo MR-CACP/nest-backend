@@ -110,6 +110,8 @@ export function translateHttpMessage(status: number, message: string): string {
   if (status === 405) return '请求方法不支持';
   if (status === 413) return '请求体过大';
   if (status === 429) return '请求过于频繁，请稍后再试';
+  // 依赖降级（健康检查等）不是内部错误，语义上要区分开
+  if (status === 503) return '服务暂时不可用，请稍后重试';
   if (status >= 500) return '服务器内部错误，请稍后重试';
   // 400 / 422 等参数校验消息已由 ValidationPipe 中文化，原样透传
   return message;

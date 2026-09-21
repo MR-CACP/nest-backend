@@ -1,28 +1,38 @@
 import { join } from 'node:path';
 
+import { ThrottlerStorageRedisService } from '@nest-lab/throttler-storage-redis';
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import type { Redis } from 'ioredis';
 import { LoggerModule } from 'nestjs-pino';
 
-import { AppController } from './app.controller';
-import { AppService } from './app.service';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
+import { genRequestId } from './common/utils/request-id';
 import {
   appConfig,
   corsConfig,
+  databaseConfig,
+  getEnvFilePaths,
   logConfig,
+  redisConfig,
   swaggerConfig,
   throttlerConfig,
 } from './config/configuration';
 import { envValidationSchema } from './config/env.validation';
+import type { NodeEnv, ThrottlerConfig } from './config/types';
+import { DatabaseModule } from './database/database.module';
+import { HealthModule } from './health/health.module';
+import { REDIS_CLIENT } from './redis/redis.constants';
+import { RedisModule } from './redis/redis.module';
 
 // 运行环境决定加载哪些 env 文件。
 // 注意：NODE_ENV 必须由进程环境注入（scripts 已用 cross-env 写入，生产由部署平台注入），
-// 不能写在 .env 文件里——加载哪个环境文件本身就取决于该变量，属于循环依赖、实际无效
-const nodeEnv = process.env.NODE_ENV ?? 'development';
+// 不能写在 .env 文件里——加载哪个环境文件本身就取决于该变量，属于循环依赖、实际无效。
+// main.ts 已 fail-fast 保证 NODE_ENV 合法，此处收窄为 NodeEnv
+const nodeEnv = (process.env.NODE_ENV ?? 'development') as NodeEnv;
 
 @Module({
   imports: [
@@ -35,13 +45,20 @@ const nodeEnv = process.env.NODE_ENV ?? 'development';
       // （pa$$word 需写成 pa\$\$word，单引号包裹无效——展开发生在引号剥离之后）；
       // 含 $ 的值更稳妥的做法是放 .env.{NODE_ENV}.local 或由部署平台注入
       expandVariables: true,
-      envFilePath: [
-        join(process.cwd(), `.env.${nodeEnv}.local`),
-        join(process.cwd(), `.env.${nodeEnv}`),
-        join(process.cwd(), '.env.local'),
-        join(process.cwd(), '.env'),
+      // 加载优先级与 TypeORM CLI（data-source.ts）共用同一份列表（getEnvFilePaths），
+      // 防止两处各自维护导致漂移；process.env 中已有的变量始终最高
+      envFilePath: getEnvFilePaths(nodeEnv).map((file) =>
+        join(process.cwd(), file),
+      ),
+      load: [
+        appConfig,
+        corsConfig,
+        logConfig,
+        swaggerConfig,
+        throttlerConfig,
+        databaseConfig,
+        redisConfig,
       ],
-      load: [appConfig, corsConfig, logConfig, swaggerConfig, throttlerConfig],
       validationSchema: envValidationSchema,
       // allowUnknown 无需设置：schema 中已声明 .unknown(true)
       validationOptions: {
@@ -51,17 +68,28 @@ const nodeEnv = process.env.NODE_ENV ?? 'development';
     // 特性模块按需注册命名空间示例：imports: [ConfigModule.forFeature(swaggerConfig)]
 
     // 限速模块：从配置命名空间读取参数（ttl 秒 -> 毫秒）。
-    // 注意：默认内存存储不跨实例，多副本部署时限额=limit×副本数，生产需换 Redis 存储
+    // THROTTLE_STORAGE=redis 时计数存 Redis（多副本共享限额）；memory 仅单进程，
+    // 多副本部署时限额=limit×副本数
     ThrottlerModule.forRootAsync({
-      inject: [ConfigService],
-      useFactory: (configService: ConfigService) => ({
-        throttlers: [
-          {
-            ttl: configService.getOrThrow<number>('throttler.ttl') * 1000,
-            limit: configService.getOrThrow<number>('throttler.limit'),
-          },
-        ],
-      }),
+      imports: [RedisModule],
+      inject: [ConfigService, REDIS_CLIENT],
+      useFactory: (configService: ConfigService, redisClient: Redis) => {
+        const throttler =
+          configService.getOrThrow<ThrottlerConfig>('throttler');
+        return {
+          throttlers: [
+            {
+              ttl: throttler.ttl * 1000,
+              limit: throttler.limit,
+            },
+          ],
+          storage:
+            throttler.storage === 'redis'
+              ? // 复用全局 Redis 客户端；前缀含 keyPrefix，天然按 REDIS_KEY_PREFIX 隔离
+                new ThrottlerStorageRedisService(redisClient)
+              : undefined,
+        };
+      },
     }),
 
     // 日志模块：级别来自配置；开发环境使用 pino-pretty 美化输出，
@@ -70,6 +98,9 @@ const nodeEnv = process.env.NODE_ENV ?? 'development';
       inject: [ConfigService],
       useFactory: (configService: ConfigService) => ({
         pinoHttp: {
+          // 关联 ID 与响应头由 genReqId 统一产生/回写（复用合法传入值，否则 UUID），
+          // 保证日志 req.id 与用户拿到的 X-Request-Id 一致（见 common/utils/request-id.ts）
+          genReqId: genRequestId,
           level: configService.getOrThrow<string>('log.level'),
           transport:
             nodeEnv !== 'production'
@@ -87,10 +118,14 @@ const nodeEnv = process.env.NODE_ENV ?? 'development';
         },
       }),
     }),
+
+    // 数据层：PostgreSQL（TypeORM，实体经 autoLoadEntities 收集）与 Redis（全局模块，
+    // 缓存门面 + 限速存储共用客户端）
+    DatabaseModule,
+    RedisModule,
+    HealthModule,
   ],
-  controllers: [AppController],
   providers: [
-    AppService,
     { provide: APP_GUARD, useClass: ThrottlerGuard },
     { provide: APP_FILTER, useClass: AllExceptionsFilter },
     { provide: APP_INTERCEPTOR, useClass: TransformInterceptor },

@@ -42,8 +42,77 @@ describe('envValidationSchema', () => {
       ...validEnv,
       NODE_ENV: 'production',
       SWAGGER_ENABLED: 'false',
+      // 生产新增强制项：数据库与 Redis 必须显式配置凭证，反向代理层数必须显式声明
+      DB_PASSWORD: 's3cret',
+      REDIS_PASSWORD: 'r3dis',
+      TRUST_PROXY: 'false',
+      CORS_ORIGIN: 'https://app.example.com',
     });
     expect(error).toBeUndefined();
+  });
+
+  it('生产环境缺少 TRUST_PROXY 被拒绝（防伪造 X-Forwarded-For）', () => {
+    const { error } = envValidationSchema.validate({
+      ...validEnv,
+      NODE_ENV: 'production',
+      DB_PASSWORD: 's3cret',
+      REDIS_PASSWORD: 'r3dis',
+      CORS_ORIGIN: 'https://app.example.com',
+    });
+    expect(error?.message).toContain('生产环境必须显式配置 TRUST_PROXY');
+  });
+
+  it('生产环境缺少 CORS_ORIGIN 被拒绝（不允许默认通配 * 静默上线）', () => {
+    const { error } = envValidationSchema.validate({
+      ...validEnv,
+      NODE_ENV: 'production',
+      DB_PASSWORD: 's3cret',
+      REDIS_PASSWORD: 'r3dis',
+      TRUST_PROXY: 'false',
+    });
+    expect(error?.message).toContain('生产环境必须显式配置 CORS_ORIGIN');
+  });
+
+  it('生产环境缺少 DB_PASSWORD / REDIS_PASSWORD 被拒绝', () => {
+    const missing = envValidationSchema.validate({
+      ...validEnv,
+      NODE_ENV: 'production',
+      REDIS_PASSWORD: 'r3dis',
+      TRUST_PROXY: 'false',
+      CORS_ORIGIN: 'https://app.example.com',
+    });
+    expect(missing.error?.message).toContain(
+      '生产环境必须显式配置 DB_PASSWORD',
+    );
+
+    const noRedis = envValidationSchema.validate({
+      ...validEnv,
+      NODE_ENV: 'production',
+      DB_PASSWORD: 's3cret',
+      TRUST_PROXY: 'false',
+      CORS_ORIGIN: 'https://app.example.com',
+    });
+    expect(noRedis.error?.message).toContain(
+      '生产环境必须显式配置 REDIS_PASSWORD',
+    );
+  });
+
+  it('生产环境 DB_SYNCHRONIZE=true 被拒绝', () => {
+    const { error } = envValidationSchema.validate({
+      ...validEnv,
+      NODE_ENV: 'production',
+      DB_SYNCHRONIZE: 'true',
+    });
+    expect(error?.message).toContain('生产环境禁止 DB_SYNCHRONIZE=true');
+  });
+
+  it('DB_POOL_MIN 大于 DB_POOL_MAX 被拒绝', () => {
+    const { error } = envValidationSchema.validate({
+      ...validEnv,
+      DB_POOL_MIN: '20',
+      DB_POOL_MAX: '10',
+    });
+    expect(error?.message).toContain('DB_POOL_MIN 不能大于 DB_POOL_MAX');
   });
 
   it('CORS_CREDENTIALS=true 搭配 CORS_ORIGIN=* 被拒绝', () => {
@@ -64,5 +133,70 @@ describe('envValidationSchema', () => {
       CORS_ORIGIN: 'https://a.com,https://b.com',
     });
     expect(error).toBeUndefined();
+  });
+
+  describe('驱动级超时顺序（statement < query，任一为 0 跳过比较）', () => {
+    it('反向配置（query=3000, statement=8000）被拒绝', () => {
+      const { error } = envValidationSchema.validate({
+        ...validEnv,
+        DB_QUERY_TIMEOUT_MS: '3000',
+        DB_STATEMENT_TIMEOUT_MS: '8000',
+      });
+      expect(error?.message).toContain('DB_STATEMENT_TIMEOUT_MS 必须小于');
+    });
+
+    it('相等配置被拒绝', () => {
+      const { error } = envValidationSchema.validate({
+        ...validEnv,
+        DB_QUERY_TIMEOUT_MS: '5000',
+        DB_STATEMENT_TIMEOUT_MS: '5000',
+      });
+      expect(error?.message).toContain('DB_STATEMENT_TIMEOUT_MS 必须小于');
+    });
+
+    it('单侧为零（禁用）跳过比较', () => {
+      const queryDisabled = envValidationSchema.validate({
+        ...validEnv,
+        DB_QUERY_TIMEOUT_MS: '0',
+        DB_STATEMENT_TIMEOUT_MS: '8000',
+      });
+      expect(queryDisabled.error).toBeUndefined();
+
+      const statementDisabled = envValidationSchema.validate({
+        ...validEnv,
+        DB_QUERY_TIMEOUT_MS: '5000',
+        DB_STATEMENT_TIMEOUT_MS: '0',
+      });
+      expect(statementDisabled.error).toBeUndefined();
+    });
+
+    it('合法顺序（query=5000, statement=4000）通过', () => {
+      const { error } = envValidationSchema.validate({
+        ...validEnv,
+        DB_QUERY_TIMEOUT_MS: '5000',
+        DB_STATEMENT_TIMEOUT_MS: '4000',
+      });
+      expect(error).toBeUndefined();
+    });
+
+    it('超出 PG 毫秒 GUC 上界（int32 max）被拒绝', () => {
+      const { error } = envValidationSchema.validate({
+        ...validEnv,
+        DB_QUERY_TIMEOUT_MS: '2147483648',
+      });
+      expect(error).toBeDefined();
+      expect(
+        error?.details.some((d) => d.path.includes('DB_QUERY_TIMEOUT_MS')),
+      ).toBe(true);
+    });
+
+    it('上界值本身通过', () => {
+      const { error } = envValidationSchema.validate({
+        ...validEnv,
+        DB_QUERY_TIMEOUT_MS: '2147483647',
+        DB_STATEMENT_TIMEOUT_MS: '2147483646',
+      });
+      expect(error).toBeUndefined();
+    });
   });
 });

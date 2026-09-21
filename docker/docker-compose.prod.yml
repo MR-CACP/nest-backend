@@ -1,0 +1,168 @@
+# 生产整栈编排：应用 + PostgreSQL + Redis + 一次性 migration 任务
+#
+# 用法（凭证模板 docker/.env.prod.example 复制为 docker/.env.prod 并填写）：
+#   docker compose -f docker/docker-compose.prod.yml --env-file docker/.env.prod config   # 校验
+#   docker compose -f docker/docker-compose.prod.yml --env-file docker/.env.prod up -d --build
+#
+# 设计要点：
+# - 数据库/Redis 不映射宿主端口，仅在 compose 内部网络可达；只有应用对外发布
+# - 凭证只出现在 --env-file（gitignore 已排除 docker/.env.prod），不进镜像层；
+#   镜像内无 .env* 文件，全部配置经 environment 注入（ConfigModule 里 process.env 优先级最高）
+# - migrate 一次性服务成功结束后 app 才启动，保证代码与 schema 版本一致
+
+name: nest-backend
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: nest-backend:latest
+    container_name: nest-backend-prod-app
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      API_PREFIX: ${API_PREFIX:-api}
+      # 应用位于反向代理（网关/nginx）之后时设定代理层数；直连部署设为 false。
+      # 无默认值：生产强制显式配置（env.validation.ts 安全策略 5，防伪造 X-Forwarded-For）
+      TRUST_PROXY: ${TRUST_PROXY:?缺少 TRUST_PROXY}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      SWAGGER_ENABLED: 'false' # 生产强制关闭（env.validation.ts 双保险）
+      # 生产必填：不允许默认通配 * 静默上线（env.validation.ts 安全策略 6）
+      CORS_ORIGIN: ${CORS_ORIGIN:?缺少 CORS_ORIGIN}
+      CORS_CREDENTIALS: ${CORS_CREDENTIALS:-false}
+      THROTTLE_TTL: ${THROTTLE_TTL:-60}
+      THROTTLE_LIMIT: ${THROTTLE_LIMIT:-100}
+      THROTTLE_STORAGE: redis # 多副本共享限速计数
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USERNAME: ${POSTGRES_USER:?缺少 POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?缺少 POSTGRES_PASSWORD}
+      DB_DATABASE: ${POSTGRES_DB:?缺少 POSTGRES_DB}
+      DB_SSL: 'false' # 同 compose 内网；数据库挪到外部托管实例时改 true
+      DB_SYNCHRONIZE: 'false'
+      DB_LOGGING: error
+      DB_POOL_MAX: ${DB_POOL_MAX:-10}
+      DB_POOL_MIN: ${DB_POOL_MIN:-2}
+      # 应用查询超时：服务端先终止（statement_timeout=4000）再客户端兜底（5000）；
+      # migrate 服务不走这些值（见下方 migrate.environment 显式置 0）
+      DB_QUERY_TIMEOUT_MS: ${DB_QUERY_TIMEOUT_MS:-5000}
+      DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-4000}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?缺少 REDIS_PASSWORD}
+      REDIS_DB: 0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-nest:}
+      REDIS_COMMAND_TIMEOUT_MS: ${REDIS_COMMAND_TIMEOUT_MS:-5000}
+    ports:
+      # 默认只绑本机回环，公网访问交由宿主上的反向代理
+      - '127.0.0.1:${APP_HOST_PORT:-3000}:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks: [backend]
+
+  # 一次性任务：应用启动前跑完全部 pending migration 后退出
+  migrate:
+    image: nest-backend:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: nest-backend-prod-migrate
+    restart: 'no'
+    environment:
+      NODE_ENV: production
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USERNAME: ${POSTGRES_USER:?缺少 POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?缺少 POSTGRES_PASSWORD}
+      DB_DATABASE: ${POSTGRES_DB:?缺少 POSTGRES_DB}
+      DB_SSL: 'false'
+      # 迁移不受应用查询超时约束：DDL/数据迁移可能远超 5s，statement_timeout
+      # 会在服务端中断长事务导致部署失败（data-source.ts 亦显式置 0 双保险）
+      DB_QUERY_TIMEOUT_MS: '0'
+      DB_STATEMENT_TIMEOUT_MS: '0'
+      # 迁移专项：锁等待超时（默认 10s）——迁移不设 statement/query 超时，
+      # 但锁等待必须有限，防止死锁时永久挂起（data-source.ts 读取）
+      DB_MIGRATION_LOCK_TIMEOUT_MS: ${DB_MIGRATION_LOCK_TIMEOUT_MS:-10000}
+      # 整体部署超时（默认 600s）：busybox timeout 包装，超时退出非零——
+      # depends_on service_completed_successfully 判定失败并告警，而不是无限等待
+    command:
+      [
+        'sh',
+        '-c',
+        'timeout "${DB_MIGRATION_TIMEOUT_SECONDS:-600}" node node_modules/typeorm/cli.js migration:run -d dist/database/data-source.js',
+      ]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [backend]
+
+  postgres:
+    image: postgres:18.6-alpine
+    container_name: nest-backend-prod-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?缺少 POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?缺少 POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:?缺少 POSTGRES_DB}
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      # 官方镜像 PGDATA=/var/lib/postgresql/data：挂载数据目录本身而非父目录，
+      # 与镜像默认布局对齐，避免升级/重排时路径歧义（同一卷内容不受影响）
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks: [backend]
+    security_opt:
+      - no-new-privileges:true
+
+  redis:
+    image: redis:8.10.1-alpine
+    container_name: nest-backend-prod-redis
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?缺少 REDIS_PASSWORD}
+    command:
+      [
+        'sh',
+        '-c',
+        'exec redis-server --requirepass "$$REDIS_PASSWORD" --appendonly yes',
+      ]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'redis-cli -a "$$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks: [backend]
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  backend:
+    driver: bridge

@@ -6,7 +6,7 @@ import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
 import { configureApp } from './../src/app.setup';
 
-describe('AppController (e2e)', () => {
+describe('应用装配 (e2e)', () => {
   let app: INestApplication<App>;
 
   beforeEach(async () => {
@@ -24,32 +24,9 @@ describe('AppController (e2e)', () => {
     await app.close();
   });
 
-  it('/api (GET) 返回统一响应结构', () => {
-    return request(app.getHttpServer())
-      .get('/api')
-      .expect(200)
-      .then((res) => {
-        expect(res.body).toMatchObject({
-          code: 0,
-          message: 'ok',
-          data: 'Hello World!',
-        });
-      });
-  });
-
   it('未知接口返回 404 与中文文案', () => {
     return request(app.getHttpServer())
       .get('/api/notexist')
-      .expect(404)
-      .then((res) => {
-        const body = res.body as { message?: string };
-        expect(body.message).toBe('接口不存在');
-      });
-  });
-
-  it('演示路由默认关闭（DEMO_ROUTES_ENABLED=false）', () => {
-    return request(app.getHttpServer())
-      .get('/api/error')
       .expect(404)
       .then((res) => {
         const body = res.body as { message?: string };
@@ -64,6 +41,29 @@ describe('AppController (e2e)', () => {
       .then((res) => {
         const headers = res.headers as Record<string, string>;
         expect(headers['cache-control']).toBe('no-store');
+      });
+  });
+
+  it('客户端携带 X-Request-Id 时透传回写', () => {
+    return request(app.getHttpServer())
+      .get('/api/notexist')
+      .set('X-Request-Id', 'trace-abc-123')
+      .expect(404)
+      .then((res) => {
+        const headers = res.headers as Record<string, string>;
+        expect(headers['x-request-id']).toBe('trace-abc-123');
+      });
+  });
+
+  it('缺失 X-Request-Id 时生成 UUID 回写', () => {
+    return request(app.getHttpServer())
+      .get('/api/notexist')
+      .expect(404)
+      .then((res) => {
+        const headers = res.headers as Record<string, string>;
+        expect(headers['x-request-id']).toMatch(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+        );
       });
   });
 });

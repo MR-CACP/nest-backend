@@ -1,0 +1,256 @@
+# CI：audit（生产依赖）→ lint（check-only）→ 单测 + 覆盖率 → build → e2e（真实容器，迁移路径）→ Docker 镜像 smoke
+#
+# 注意：.env.* 一律不入库（见 .gitignore），因此本工作流通过 job env 显式
+# 注入全部配置，与 .env.test 等价；若新增环境变量，需同步补充到下方 env 块。
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  # 与 .env.test 对齐（NODE_ENV 由各 job 单独设置）
+  TRUST_PROXY: 'false'
+  API_PREFIX: api
+  LOG_LEVEL: info
+  SWAGGER_ENABLED: 'false'
+  SWAGGER_PATH: docs
+  THROTTLE_TTL: 60
+  THROTTLE_LIMIT: 10
+  THROTTLE_STORAGE: memory
+  CORS_ORIGIN: '*'
+  CORS_CREDENTIALS: 'false'
+  DB_HOST: localhost
+  DB_PORT: 5432
+  DB_USERNAME: nest_app
+  DB_PASSWORD: pg_dev_password
+  DB_DATABASE: nest_test
+  DB_SSL: 'false'
+  DB_SSL_REJECT_UNAUTHORIZED: 'true'
+  DB_SYNCHRONIZE: 'true'
+  DB_LOGGING: error
+  DB_POOL_MAX: 10
+  DB_POOL_MIN: 2
+  DB_POOL_IDLE_TIMEOUT_MS: 30000
+  DB_POOL_CONNECTION_TIMEOUT_MS: 10000
+  DB_QUERY_TIMEOUT_MS: 5000
+  DB_STATEMENT_TIMEOUT_MS: 4000
+  REDIS_HOST: localhost
+  REDIS_PORT: 6379
+  REDIS_PASSWORD: redis_dev_password
+  REDIS_DB: 1
+  REDIS_KEY_PREFIX: 'nest-test:'
+  REDIS_COMMAND_TIMEOUT_MS: 5000
+
+jobs:
+  lint:
+    name: Lint (check-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint:check
+
+  audit:
+    name: Audit production deps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # 门禁范围仅为生产依赖（--prod）：
+      # - multer 已通过 pnpm-workspace.yaml 的 overrides 固定到 2.3+，生产依赖 audit 归零；
+      # - 完整 pnpm audit 仍有 1 个已知高危：glob CLI command-injection
+      #   （GHSA-5j98-mcp5-4vw2，jest→babel-plugin-istanbul→test-exclude 链路，纯开发依赖），
+      #   仅在 glob -c/--cmd 处理不可信匹配时可利用，正常 jest 执行不触发，故不 override、不阻断 CI。
+      # 例外流程：若未来出现可被 CI/运行时实际利用的漏洞，先评审影响面再在此记录例外，禁止无记录放宽
+      - run: pnpm audit --prod
+
+  test:
+    name: Unit tests + coverage
+    runs-on: ubuntu-latest
+    env:
+      NODE_ENV: test
+    services:
+      postgres:
+        image: postgres:18.6-alpine
+        env:
+          POSTGRES_USER: nest_app
+          POSTGRES_PASSWORD: pg_dev_password
+          POSTGRES_DB: nest_test
+          TZ: UTC
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nest_app -d nest_test"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:8.10.1-alpine
+        ports:
+          - 6379:6379
+        # requirepass 必须与应用侧 REDIS_PASSWORD 一致：镜像默认命令不启用认证，
+        # 只改客户端会让 e2e 的 AUTH 失败（health 的 PONG grep 会掩盖该问题）。
+        # 注意：services.<id>.command 类型必须是字符串（GitHub Actions schema 校验，非数组）
+        command: redis-server --requirepass redis_dev_password --appendonly no
+        options: >-
+          --health-cmd "redis-cli --no-auth-warning -a redis_dev_password ping | grep -q PONG"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # 覆盖率阈值在 package.json 的 jest.coverageThreshold 中配置
+      - run: pnpm test:cov
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          retention-days: 7
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+  e2e:
+    name: E2E (service containers, migration path)
+    runs-on: ubuntu-latest
+    env:
+      NODE_ENV: test
+      # 走生产同款迁移路径（synchronize=false）：先在测试库执行迁移再启动应用，
+      # 防止只有 DB_SYNCHRONIZE=true 的路径被测试到（本地 .env.test 仍为 true 方便原型期）
+      DB_SYNCHRONIZE: 'false'
+    services:
+      postgres:
+        image: postgres:18.6-alpine
+        env:
+          POSTGRES_USER: nest_app
+          POSTGRES_PASSWORD: pg_dev_password
+          POSTGRES_DB: nest_test
+          TZ: UTC
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nest_app -d nest_test"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:8.10.1-alpine
+        ports:
+          - 6379:6379
+        command: redis-server --requirepass redis_dev_password --appendonly no
+        options: >-
+          --health-cmd "redis-cli --no-auth-warning -a redis_dev_password ping | grep -q PONG"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # 迁移路径：与生产一致（DB_SYNCHRONIZE=false 时 schema 只能来自 migration）
+      - run: pnpm migration:run:test
+      - run: pnpm test:e2e
+
+  docker-smoke:
+    name: Docker image build + smoke (production config)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.6-alpine
+        env:
+          POSTGRES_USER: nest_app
+          POSTGRES_PASSWORD: pg_dev_password
+          POSTGRES_DB: nest_test
+          TZ: UTC
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nest_app -d nest_test"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:8.10.1-alpine
+        ports:
+          - 6379:6379
+        command: redis-server --requirepass redis_dev_password --appendonly no
+        options: >-
+          --health-cmd "redis-cli --no-auth-warning -a redis_dev_password ping | grep -q PONG"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -f docker/Dockerfile -t nest-backend:ci .
+      - name: Run smoke container (production env, no .env files)
+        run: >
+          docker run -d --name nest-backend-smoke --network host
+          -e NODE_ENV=production
+          -e PORT=3000
+          -e API_PREFIX=api
+          -e TRUST_PROXY=false
+          -e LOG_LEVEL=info
+          -e SWAGGER_ENABLED=false
+          -e CORS_ORIGIN='*'
+          -e CORS_CREDENTIALS=false
+          -e THROTTLE_TTL=60
+          -e THROTTLE_LIMIT=1000
+          -e THROTTLE_STORAGE=redis
+          -e DB_HOST=127.0.0.1
+          -e DB_PORT=5432
+          -e DB_USERNAME=nest_app
+          -e DB_PASSWORD=pg_dev_password
+          -e DB_DATABASE=nest_test
+          -e DB_SSL=false
+          -e DB_SYNCHRONIZE=false
+          -e DB_LOGGING=error
+          -e REDIS_HOST=127.0.0.1
+          -e REDIS_PORT=6379
+          -e REDIS_PASSWORD=redis_dev_password
+          -e REDIS_DB=1
+          -e REDIS_KEY_PREFIX='nest-test:'
+          nest-backend:ci
+      - name: Wait for /health/ready (max 30s)
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3000/api/health/ready >/dev/null 2>&1; then
+              echo "smoke OK"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::smoke container never became ready"
+          docker logs nest-backend-smoke
+          exit 1

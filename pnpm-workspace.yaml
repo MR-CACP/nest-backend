@@ -3,3 +3,9 @@ allowBuilds:
   '@parcel/watcher': true
   '@scarf/scarf': false
   unrs-resolver: true
+
+# 依赖覆盖（pnpm 12 起不再读 package.json 的 pnpm 字段，必须写在这里）：
+# @nestjs/platform-express 11.2.5 锁定 multer 2.2.0，存在 3 高危+1 低危漏洞（见 pnpm audit），
+# 强制提升到 2.3+（API 兼容）；升级 Nest 主版本到自带 multer 2.3+ 的 release 后移除
+overrides:
+  multer: ^2.3.0

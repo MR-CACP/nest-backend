@@ -42,6 +42,12 @@ export class AllExceptionsFilter implements ExceptionFilter {
       status = HttpStatus.OK;
       code = exception.bizCode;
       message = exception.message;
+      // 业务异常固定 HTTP 200，状态码无法表达失败：用响应头 + warn 日志补偿可观测性，
+      // 否则 APM/告警按状态码统计会把业务失败误判为成功
+      response.setHeader('X-Business-Code', String(code));
+      this.logger.warn(
+        `[业务异常] ${request.method} ${request.path} -> code=${code} ${message}`,
+      );
     } else if (exception instanceof HttpException) {
       status = exception.getStatus();
       code = status;
@@ -67,13 +73,15 @@ export class AllExceptionsFilter implements ExceptionFilter {
     response.setHeader('Cache-Control', 'no-store');
 
     // 5xx 结构化记录：消息与堆栈分开传给 pino（堆栈独立成字段，避免换行伪造日志，便于检索）
+    // 路径一律用 request.path（不含 query）：query 常携带搜索词/邮箱/令牌/OAuth code，
+    // 日志与响应体都不应回显（需要定位参数时另行在结构化字段中脱敏记录）
     if (status >= 500) {
       this.logger.error(
-        `${request.method} ${request.url} -> ${status}`,
+        `${request.method} ${request.path} -> ${status}`,
         exception instanceof Error ? exception.stack : String(exception),
       );
     }
 
-    response.status(status).json(fail(code, message, request.url));
+    response.status(status).json(fail(code, message, request.path));
   }
 }

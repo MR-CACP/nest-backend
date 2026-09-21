@@ -1,0 +1,22 @@
+# 镜像只带 dist + 生产依赖：源码经多阶段编译，构建层不进运行镜像
+node_modules
+dist
+coverage
+
+# 秘密与环境文件绝不进镜像（生产配置全部经 compose environment 注入）
+.env
+.env.*
+!.env.example
+docker/.env.prod
+
+# 版本库与工具目录
+.git
+.vscode
+.workbuddy
+*.log
+*.tsbuildinfo
+Dockerfile
+docker-compose*.yml
+docker/init
+README.md
+test

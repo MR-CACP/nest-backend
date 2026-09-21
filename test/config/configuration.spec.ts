@@ -32,7 +32,7 @@ describe('configuration/appConfig', () => {
       ['false', false],
       ['true', true],
       ['2', 2],
-      [undefined, 1], // 缺省时默认信任一层
+      [undefined, false], // 缺省时不信任代理（安全默认）
     ] as const)('TRUST_PROXY=%j -> %j', (raw, expected) => {
       process.env.NODE_ENV = 'test';
       if (raw === undefined) {
@@ -41,22 +41,6 @@ describe('configuration/appConfig', () => {
         process.env.TRUST_PROXY = raw;
       }
       expect(appConfig().trustProxy).toBe(expected);
-    });
-  });
-
-  describe('DEMO_ROUTES_ENABLED 解析', () => {
-    it.each([
-      ['true', true],
-      ['false', false],
-      [undefined, false], // 缺省默认关闭
-    ] as const)('DEMO_ROUTES_ENABLED=%j -> %j', (raw, expected) => {
-      process.env.NODE_ENV = 'test';
-      if (raw === undefined) {
-        delete process.env.DEMO_ROUTES_ENABLED;
-      } else {
-        process.env.DEMO_ROUTES_ENABLED = raw;
-      }
-      expect(appConfig().demoRoutesEnabled).toBe(expected);
     });
   });
 });

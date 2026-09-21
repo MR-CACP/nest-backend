@@ -40,6 +40,9 @@ export function configureApp(app: INestApplication): {
 
   app.use(helmet()); // 安全响应头
 
+  // X-Request-Id 关联 ID 由 pino-http 的 genReqId 统一生成/回写（见 app.module.ts 与
+  // common/utils/request-id.ts）：日志 req.id 与响应头必须同源，这里不再单独挂中间件
+
   // 信任反向代理：从 X-Forwarded-For 取真实客户端 IP（层数经 TRUST_PROXY 配置化，
   // 无代理直连部署应设 false，避免客户端伪造 X-Forwarded-For 影响限流与日志）。
   // 网关侧应清洗转发头；多实例部署时限流仍需换 Redis 存储
