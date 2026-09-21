@@ -1,5 +1,7 @@
 import Joi from 'joi';
 
+import { PG_MS_GUC_MAX } from './configuration';
+
 /**
  * 环境变量校验：ConfigModule 加载完 env 文件后对 process.env 执行，
  * 任何缺失或非法的变量都会让应用启动失败（fail fast）。
@@ -76,12 +78,12 @@ export const envValidationSchema = Joi.object({
   DB_QUERY_TIMEOUT_MS: Joi.number()
     .integer()
     .min(0)
-    .max(2_147_483_647)
+    .max(PG_MS_GUC_MAX)
     .default(5000),
   DB_STATEMENT_TIMEOUT_MS: Joi.number()
     .integer()
     .min(0)
-    .max(2_147_483_647)
+    .max(PG_MS_GUC_MAX)
     .default(4000),
 
   // ---------- Redis ----------
@@ -99,8 +101,15 @@ export const envValidationSchema = Joi.object({
   REDIS_COMMAND_TIMEOUT_MS: Joi.number()
     .integer()
     .min(0)
-    .max(2_147_483_647)
+    .max(PG_MS_GUC_MAX)
     .default(5000),
+
+  // ---------- JWT（认证模块） ----------
+  // 签名密钥：故意不设默认值——开发环境由 jwtConfig 工厂兜底弱密钥（仅本地），
+  // 生产强制显式配置（见 custom 安全策略 7），防止弱密钥静默上线
+  JWT_SECRET: Joi.string().trim().min(16),
+  JWT_ACCESS_TTL_SECONDS: Joi.number().integer().min(60).default(900),
+  JWT_REFRESH_TTL_SECONDS: Joi.number().integer().min(60).default(604800),
 })
   .unknown(true)
   // joi 18 的 when 不支持在条件里引用同级 key，跨字段规则需用 custom 实现
@@ -154,6 +163,31 @@ export const envValidationSchema = Joi.object({
     if (value.NODE_ENV === 'production' && value.CORS_ORIGIN === undefined) {
       return helpers.error('cors.origin.prod');
     }
+    // 安全策略 7：生产必须显式配置 JWT_SECRET（开发兜底弱密钥严禁上线）
+    if (value.NODE_ENV === 'production' && value.JWT_SECRET === undefined) {
+      return helpers.error('jwt.secret.prod');
+    }
+    // 弱密钥黑名单（仅生产）：示例/占位值哪怕长度达标也不允许上线
+    //（docker/.env.prod.example 的占位符本身有 41 字符，min(16) 拦不住）；
+    // 开发环境放行——jwtConfig 工厂的兜底弱密钥就是 dev-only-secret-change-me
+    if (
+      value.NODE_ENV === 'production' &&
+      typeof value.JWT_SECRET === 'string' &&
+      /(change_me|dev-only-secret)/i.test(value.JWT_SECRET)
+    ) {
+      return helpers.error('jwt.secret.weak');
+    }
+    // access token 必须显著短于 refresh token（刷新链路的续期能力设计前提）；
+    // 配置成相等或倒挂会让 access 形同 refresh，轮换失去意义
+    const accessTtl = Number(value.JWT_ACCESS_TTL_SECONDS);
+    const refreshTtl = Number(value.JWT_REFRESH_TTL_SECONDS);
+    if (
+      Number.isFinite(accessTtl) &&
+      Number.isFinite(refreshTtl) &&
+      accessTtl >= refreshTtl
+    ) {
+      return helpers.error('jwt.ttl.order');
+    }
     return value;
   }, '跨字段安全规则')
   .messages({
@@ -170,4 +204,9 @@ export const envValidationSchema = Joi.object({
     'trustProxy.prod': '生产环境必须显式配置 TRUST_PROXY（无代理直连设 false）',
     'cors.origin.prod':
       '生产环境必须显式配置 CORS_ORIGIN（不允许默认通配 * 静默上线）',
+    'jwt.secret.prod': '生产环境必须显式配置 JWT_SECRET',
+    'jwt.secret.weak':
+      'JWT_SECRET 使用了示例/占位密钥（change_me / dev-only-secret），严禁上线',
+    'jwt.ttl.order':
+      'JWT_ACCESS_TTL_SECONDS 必须小于 JWT_REFRESH_TTL_SECONDS（access 应显著短于 refresh）',
   });

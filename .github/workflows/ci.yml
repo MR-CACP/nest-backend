@@ -28,7 +28,7 @@ env:
   DB_DATABASE: nest_test
   DB_SSL: 'false'
   DB_SSL_REJECT_UNAUTHORIZED: 'true'
-  DB_SYNCHRONIZE: 'true'
+  DB_SYNCHRONIZE: 'false'
   DB_LOGGING: error
   DB_POOL_MAX: 10
   DB_POOL_MIN: 2
@@ -42,6 +42,10 @@ env:
   REDIS_DB: 1
   REDIS_KEY_PREFIX: 'nest-test:'
   REDIS_COMMAND_TIMEOUT_MS: 5000
+  # JWT：测试专用密钥（e2e 需要真实签发/校验令牌）
+  JWT_SECRET: test-only-secret-for-e2e
+  JWT_ACCESS_TTL_SECONDS: 900
+  JWT_REFRESH_TTL_SECONDS: 604800
 
 jobs:
   lint:
@@ -58,6 +62,9 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint:check
+      # 类型闸门：ts-jest 的 isolatedModules 只转译不查类型，tsconfig.build.json 又排除 test/，
+      # 测试代码的类型错误只有这里能兜住（tsc --noEmit 对全量 tsconfig.json 生效）
+      - run: pnpm exec tsc --noEmit -p tsconfig.json
 
   audit:
     name: Audit production deps
@@ -149,7 +156,8 @@ jobs:
     env:
       NODE_ENV: test
       # 走生产同款迁移路径（synchronize=false）：先在测试库执行迁移再启动应用，
-      # 防止只有 DB_SYNCHRONIZE=true 的路径被测试到（本地 .env.test 仍为 true 方便原型期）
+      # 防止只有 DB_SYNCHRONIZE=true 的路径被测试到（.env.test 与顶层 env 均已为 false，
+      # 全链路只有迁移路径，无同步路径可测）
       DB_SYNCHRONIZE: 'false'
     services:
       postgres:
@@ -241,6 +249,7 @@ jobs:
           -e REDIS_PASSWORD=redis_dev_password
           -e REDIS_DB=1
           -e REDIS_KEY_PREFIX='nest-test:'
+          -e JWT_SECRET=ci-smoke-secret-0123456789abcdef
           nest-backend:ci
       - name: Wait for /health/ready (max 30s)
         run: |

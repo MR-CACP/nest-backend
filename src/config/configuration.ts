@@ -5,6 +5,7 @@ import type {
   CorsConfig,
   DatabaseConfig,
   DbLoggingOption,
+  JwtConfig,
   LogConfig,
   LogLevel,
   NodeEnv,
@@ -76,6 +77,22 @@ export const throttlerConfig = registerAs('throttler', (): ThrottlerConfig => ({
 export const logConfig = registerAs('log', (): LogConfig => ({
   level: (process.env.LOG_LEVEL ?? 'info') as LogLevel,
 }));
+
+export const jwtConfig = registerAs('jwt', (): JwtConfig => {
+  // 开发缺省用显式标记的弱密钥（仅本地试跑）；生产缺失会直接启动失败（安全策略 7），
+  // 不会把弱密钥静默带上线
+  return {
+    // 同步 trim：Joi 校验的 .trim() 只作用于校验副本、不回写 process.env，
+    // 若这里读原始值，带首尾空白的密钥会"校验通过（trim 后）、签名用未 trim 值"，
+    // 校验与运行时不同源——此处 trim 保证两侧严格一致（误带空白被自动修正）
+    secret: process.env.JWT_SECRET?.trim() ?? 'dev-only-secret-change-me',
+    accessTtlSeconds: parseInt(process.env.JWT_ACCESS_TTL_SECONDS ?? '900', 10),
+    refreshTtlSeconds: parseInt(
+      process.env.JWT_REFRESH_TTL_SECONDS ?? '604800',
+      10,
+    ),
+  };
+});
 
 // ---------- 环境变量解析（不依赖 Nest 上下文，供 CLI/脚本复用） ----------
 
@@ -152,6 +169,9 @@ export function buildRedisConfigFromEnv(
   };
 }
 
+/** PostgreSQL 毫秒型 GUC 上界（int32 max）：超界值会被 PostgreSQL 以 out of range 拒绝 */
+export const PG_MS_GUC_MAX = 2_147_483_647;
+
 /**
  * 迁移专项锁等待超时（毫秒，0=禁用）：仅 TypeORM CLI（data-source.ts）使用，
  * 不经过 Joi 运行时校验（CLI 路径直接读原始 env）。迁移不设 statement/query 超时
@@ -159,9 +179,6 @@ export function buildRedisConfigFromEnv(
  * 自身死锁时会永久挂起，compose 的 migrate 服务永远到不了 completed。
  * 非法值回退默认 10000ms，保证部署不会因配置笔误直接失败。
  */
-/** PostgreSQL 毫秒型 GUC 上界（int32 max）：超界值会被 PostgreSQL 以 out of range 拒绝 */
-export const PG_MS_GUC_MAX = 2_147_483_647;
-
 export function parseMigrationLockTimeoutMs(
   env: NodeJS.ProcessEnv = process.env,
 ): number {

@@ -42,13 +42,78 @@ describe('envValidationSchema', () => {
       ...validEnv,
       NODE_ENV: 'production',
       SWAGGER_ENABLED: 'false',
-      // 生产新增强制项：数据库与 Redis 必须显式配置凭证，反向代理层数必须显式声明
+      // 生产新增强制项：数据库与 Redis 必须显式配置凭证，反向代理层数必须显式声明，
+      // JWT 签名密钥必须显式配置（>=16 字符，无默认值）
+      DB_PASSWORD: 's3cret',
+      REDIS_PASSWORD: 'r3dis',
+      TRUST_PROXY: 'false',
+      CORS_ORIGIN: 'https://app.example.com',
+      JWT_SECRET: 'prod-secret-0123456789abcdef',
+    });
+    expect(error).toBeUndefined();
+  });
+
+  it('生产环境缺少 JWT_SECRET 被拒绝（无默认值，防弱密钥静默上线）', () => {
+    const { error } = envValidationSchema.validate({
+      ...validEnv,
+      NODE_ENV: 'production',
       DB_PASSWORD: 's3cret',
       REDIS_PASSWORD: 'r3dis',
       TRUST_PROXY: 'false',
       CORS_ORIGIN: 'https://app.example.com',
     });
-    expect(error).toBeUndefined();
+    expect(error?.message).toContain('生产环境必须显式配置 JWT_SECRET');
+  });
+
+  it('JWT_SECRET 使用示例/占位密钥在生产被拒绝（长度达标也拦不住占位符）', () => {
+    const { error } = envValidationSchema.validate({
+      ...validEnv,
+      NODE_ENV: 'production',
+      // docker/.env.prod.example 的占位符本身有 41 字符，min(16) 会放行
+      JWT_SECRET: 'change_me_random_secret_at_least_16_chars',
+      DB_PASSWORD: 's3cret',
+      REDIS_PASSWORD: 'r3dis',
+      TRUST_PROXY: 'false',
+      CORS_ORIGIN: 'https://app.example.com',
+    });
+    expect(error?.message).toContain(
+      'JWT_SECRET 使用了示例/占位密钥（change_me / dev-only-secret）',
+    );
+  });
+
+  it('JWT 开发兜底密钥在生产同样被拒（dev-only-secret 黑名单）', () => {
+    const { error } = envValidationSchema.validate({
+      ...validEnv,
+      NODE_ENV: 'production',
+      JWT_SECRET: 'dev-only-secret-change-me',
+      DB_PASSWORD: 's3cret',
+      REDIS_PASSWORD: 'r3dis',
+      TRUST_PROXY: 'false',
+      CORS_ORIGIN: 'https://app.example.com',
+    });
+    expect(error?.message).toContain('JWT_SECRET 使用了示例/占位密钥');
+  });
+
+  it('JWT_ACCESS_TTL 不小于 JWT_REFRESH_TTL 被拒绝（access 必须显著短于 refresh）', () => {
+    const { error } = envValidationSchema.validate({
+      ...validEnv,
+      JWT_SECRET: 'prod-secret-0123456789abcdef',
+      JWT_ACCESS_TTL_SECONDS: '900',
+      JWT_REFRESH_TTL_SECONDS: '900', // 相等：access 形同 refresh
+    });
+    expect(error?.message).toContain(
+      'JWT_ACCESS_TTL_SECONDS 必须小于 JWT_REFRESH_TTL_SECONDS',
+    );
+  });
+
+  it('JWT_ACCESS_TTL 倒挂（大于 refresh）被拒绝', () => {
+    const { error } = envValidationSchema.validate({
+      ...validEnv,
+      JWT_SECRET: 'prod-secret-0123456789abcdef',
+      JWT_ACCESS_TTL_SECONDS: '604800',
+      JWT_REFRESH_TTL_SECONDS: '900',
+    });
+    expect(error?.message).toContain('JWT_ACCESS_TTL_SECONDS 必须小于');
   });
 
   it('生产环境缺少 TRUST_PROXY 被拒绝（防伪造 X-Forwarded-For）', () => {

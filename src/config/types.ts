@@ -43,6 +43,16 @@ export interface LogConfig {
   level: LogLevel;
 }
 
+/** JWT 认证配置（jwt 命名空间） */
+export interface JwtConfig {
+  /** 签名密钥；开发缺省用兜底弱密钥（仅本地），生产必须显式配置（安全策略 7） */
+  secret: string;
+  /** 访问令牌有效期（秒，默认 15 分钟）：无状态不存库，TTL 短以缩小泄露窗口 */
+  accessTtlSeconds: number;
+  /** 刷新令牌有效期（秒，默认 7 天）：DB 存哈希，撤销/过期即失效 */
+  refreshTtlSeconds: number;
+}
+
 export interface DatabaseConfig {
   host: string;
   port: number;

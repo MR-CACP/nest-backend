@@ -1,7 +1,9 @@
-# 依赖构建脚本白名单（有意的供应链策略）：@scarf/scarf 为依赖遥测采集，显式禁用
+# 依赖构建脚本白名单（有意的供应链策略）：@scarf/scarf 为依赖遥测采集，显式禁用；
+# bcrypt 为原生模块，postinstall 负责下载/编译 prebuilt 二进制（Node 密码哈希用）
 allowBuilds:
   '@parcel/watcher': true
   '@scarf/scarf': false
+  bcrypt: true
   unrs-resolver: true
 
 # 依赖覆盖（pnpm 12 起不再读 package.json 的 pnpm 字段，必须写在这里）：

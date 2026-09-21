@@ -39,7 +39,7 @@ export function buildRedisClientOptions(cfg: RedisConfig): RedisOptions {
  *
  * 设计取舍：客户端总是创建（即使 THROTTLE_STORAGE=memory 不用于限速存储），
  * 且 /api/health 会 ping Redis 并计入整体状态——即"Redis 是模板必需依赖"。
- * 若未来要支持无 Redis 部署，需改为懒创建客户端 + 健康检查按组件降级（见 CODE_REVIEW P2-6）。
+ * 若未来要支持无 Redis 部署，需改为懒创建客户端 + 健康检查按组件降级。
  */
 @Global()
 @Module({

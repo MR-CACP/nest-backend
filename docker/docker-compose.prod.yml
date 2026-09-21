@@ -55,6 +55,10 @@ services:
       REDIS_DB: 0
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-nest:}
       REDIS_COMMAND_TIMEOUT_MS: ${REDIS_COMMAND_TIMEOUT_MS:-5000}
+      # 认证：签名密钥生产必填（env.validation.ts 安全策略 7）
+      JWT_SECRET: ${JWT_SECRET:?缺少 JWT_SECRET}
+      JWT_ACCESS_TTL_SECONDS: ${JWT_ACCESS_TTL_SECONDS:-900}
+      JWT_REFRESH_TTL_SECONDS: ${JWT_REFRESH_TTL_SECONDS:-604800}
     ports:
       # 默认只绑本机回环，公网访问交由宿主上的反向代理
       - '127.0.0.1:${APP_HOST_PORT:-3000}:3000'

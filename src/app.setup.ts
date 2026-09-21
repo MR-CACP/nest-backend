@@ -2,6 +2,7 @@ import type { INestApplication } from '@nestjs/common';
 import { BadRequestException, ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
 
 import { formatValidationErrors } from './common/utils/error-messages';
@@ -39,6 +40,10 @@ export function configureApp(app: INestApplication): {
   const swaggerConfig = configService.getOrThrow<SwaggerConfig>('swagger');
 
   app.use(helmet()); // 安全响应头
+
+  // 解析 Cookie（认证模块的 refresh token 走 httpOnly Cookie）：
+  // 读写分离——读取需解析中间件，写入用 res.cookie（Express 原生）
+  app.use(cookieParser());
 
   // X-Request-Id 关联 ID 由 pino-http 的 genReqId 统一生成/回写（见 app.module.ts 与
   // common/utils/request-id.ts）：日志 req.id 与响应头必须同源，这里不再单独挂中间件
@@ -81,6 +86,9 @@ export function configureApp(app: INestApplication): {
       .setTitle('nest-backend API')
       .setDescription('NestJS 后端服务接口文档')
       .setVersion(readPkgVersion()) // 与 package.json 保持一致，避免双真相源
+      // 声明 Bearer 安全方案：配合控制器上的 @ApiBearerAuth()，
+      // Swagger UI 顶部出现 Authorize 按钮，受保护接口可在此挂 access token
+      .addBearerAuth()
       .build();
     const document = SwaggerModule.createDocument(app, documentConfig);
     SwaggerModule.setup(swaggerConfig.path, app, document);

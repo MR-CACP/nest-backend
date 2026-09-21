@@ -16,6 +16,7 @@ import {
   corsConfig,
   databaseConfig,
   getEnvFilePaths,
+  jwtConfig,
   logConfig,
   redisConfig,
   swaggerConfig,
@@ -25,6 +26,7 @@ import { envValidationSchema } from './config/env.validation';
 import type { NodeEnv, ThrottlerConfig } from './config/types';
 import { DatabaseModule } from './database/database.module';
 import { HealthModule } from './health/health.module';
+import { AuthModule } from './modules/auth/auth.module';
 import { REDIS_CLIENT } from './redis/redis.constants';
 import { RedisModule } from './redis/redis.module';
 
@@ -58,6 +60,7 @@ const nodeEnv = (process.env.NODE_ENV ?? 'development') as NodeEnv;
         throttlerConfig,
         databaseConfig,
         redisConfig,
+        jwtConfig,
       ],
       validationSchema: envValidationSchema,
       // allowUnknown 无需设置：schema 中已声明 .unknown(true)
@@ -124,6 +127,8 @@ const nodeEnv = (process.env.NODE_ENV ?? 'development') as NodeEnv;
     DatabaseModule,
     RedisModule,
     HealthModule,
+    // 认证模块：本阶段注册 User / RefreshToken 数据模型（实体见 src/modules/auth/entities）
+    AuthModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },

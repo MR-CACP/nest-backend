@@ -257,10 +257,13 @@ describe('buildTypeOrmOptions', () => {
   it('entities/migrations 使用 glob 且 migrations 锚定本模块目录', () => {
     const options = buildTypeOrmOptions(base);
     expect(options.migrations).toHaveLength(1);
-    expect(String(options.migrations[0])).toMatch(
-      /migrations[\\/]\*\.\{ts,js\}/,
-    );
-    expect(String(options.entities[0])).toMatch(/\.entity\.\{ts,js\}$/);
+    // MixedList<string | Function> 不能下标访问：用匹配器断言元素形状（等价且类型安全）
+    expect(options.migrations).toEqual([
+      expect.stringMatching(/migrations[\\/]\*\.\{ts,js\}/),
+    ]);
+    expect(options.entities).toEqual([
+      expect.stringMatching(/\.entity\.\{ts,js\}$/),
+    ]);
   });
 
   it('overrides 允许覆盖（CLI 场景强制 synchronize=false 等）', () => {

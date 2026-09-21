@@ -23,6 +23,7 @@
 - [快速开始](#快速开始)
 - [环境变量](#环境变量)
 - [运行测试](#运行测试)
+- [认证接口](#认证接口)
 - [数据层与迁移](#数据层与迁移)
 - [健康检查与可观测性](#健康检查与可观测性)
 - [项目规范](#项目规范)
@@ -35,11 +36,12 @@
 
 ## 项目简介
 
-面向新手学习与二次开发的 NestJS 后端模板。默认只提供**基础设施能力**（配置、日志、限速、统一响应、健康检查、数据库/缓存接入），业务模块（认证、RBAC 等）按需在 `src/modules/` 下扩展。
+面向新手学习与二次开发的 NestJS 后端模板。默认提供**基础设施能力**（配置、日志、限速、统一响应、健康检查、数据库/缓存接入）与**认证模块**（注册/登录/刷新/登出/当前用户），RBAC、审计等业务模块按需在 `src/modules/` 下扩展。
 
 ## 核心特性
 
-- **分层配置**：`.env` + `.env.{NODE_ENV}` 两级加载，Joi 启动校验，内置 6 条生产安全策略（见[环境变量](#环境变量)）。
+- **分层配置**：`.env` + `.env.{NODE_ENV}` 两级加载，Joi 启动校验，内置 7 条生产安全策略（见[环境变量](#环境变量)）。
+- **认证**：注册/登录/刷新/登出/当前用户五端点；access token（JWT，15 分钟）+ refresh token（httpOnly Cookie + 响应体回传，7 天，刷新即轮换）双令牌方案，密码 bcrypt 哈希、登录失败统一文案防枚举（详见[认证接口](#认证接口)）。**刷新失败是分裂语义：令牌无效/已撤销/过期为 HTTP 401，账号被禁为 HTTP 200 + 非零 `code`（`X-Business-Code: 10001`）——前端必须同时判 401 与非零 code，否则被禁客户端会反复重试刷新**。
 - **结构化日志**：pino（nestjs-pino），自动请求关联 ID（`X-Request-Id` 与日志 `req.id` 同源），敏感请求头脱敏。
 - **统一响应**：成功/失败共用 `{ code, message, data, path, timestamp }` 结构，由全局拦截器与异常过滤器保证。
 - **业务异常契约**：`BusinessException` 返回 HTTP 200 + 业务码（国内业务码惯例），`X-Business-Code` 响应头 + warn 日志补偿可观测性。
@@ -63,6 +65,7 @@
 | 日志 | pino（nestjs-pino / pino-http / pino-pretty） | ^5.2.0 / ^11.0.0 / ^13.1.3 |
 | 限速 | `@nestjs/throttler` + Redis 存储 | ^6.7.0 / ^1.2.0 |
 | 安全 | helmet | ^8.3.0 |
+| 认证 | `@nestjs/jwt` / bcrypt / cookie-parser | ^11.0.2 / ^6.0.0 / ^1.4.7 |
 | API 文档 | `@nestjs/swagger` | ^11.4.7 |
 | 测试 | Jest + Supertest | ^30.0.0 / ^7.0.0 |
 | 代码质量 | ESLint 9 + Prettier（含 import 排序） | ^9.18.0 / ^3.4.2 |
@@ -81,10 +84,12 @@ src/
 │   └── interceptors/        # TransformInterceptor（成功响应包装）
 ├── config/                  # types（类型定义）/ env.validation（Joi 校验 + 安全策略）/ configuration（命名空间工厂）
 ├── database/                # database.module（运行时连接）/ data-source.ts（TypeORM CLI 迁移专用）
+├── modules/
+│   └── auth/                # 认证模块：User / RefreshToken 实体 + 注册/登录/刷新/登出/me（JWT + Cookie 双令牌）
 ├── redis/                   # redis.service（缓存门面）/ redis.module（客户端构建，超时选项纯函数）
 └── health/                  # health.controller（live/ready/check）+ health.module
 
-test/                        # 测试目录，结构与 src/ 对应（12 单测 suite + 2 e2e suite）
+test/                        # 测试目录，结构与 src/ 对应（17 单测 suite + 3 e2e suite）
 ```
 
 ## 快速开始
@@ -155,6 +160,8 @@ $ pnpm run format             # Prettier 格式化
 | `REDIS_DB` | `0` | 逻辑库编号 0-15 |
 | `REDIS_KEY_PREFIX` | `nest:` | 键前缀（以 `:` 结尾），同实例多应用隔离 |
 | `REDIS_COMMAND_TIMEOUT_MS` | `5000` | 单条命令超时（毫秒，`0=禁用`）；防依赖假死挂起调用方 |
+| `JWT_SECRET` | 无默认值（开发兜底示例值） | JWT 签名密钥，**>=16 字符**；生产必填（缺失启动失败）。首尾空白自动去除（Joi 校验与 `jwtConfig` 工厂同源 trim，避免"校验通过但签名用未 trim 值"）。生成：`node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"` |
+| `JWT_ACCESS_TTL_SECONDS` / `JWT_REFRESH_TTL_SECONDS` | `900` / `604800` | access token 有效期（秒，短 TTL 缩小泄露窗口）/ refresh token 有效期（秒，DB 存哈希，撤销即失效） |
 
 **迁移专项**（仅 CLI / 生产 migrate 服务读取，不进入应用运行时）：
 
@@ -171,16 +178,17 @@ $ pnpm run format             # Prettier 格式化
 4. `TRUST_PROXY` 必填（显式声明代理层数或 `false`，不允许默认值静默上线）。
 5. `CORS_ORIGIN` 必填（不允许默认通配 `*` 静默上线）；`CORS_CREDENTIALS=true` 时 `CORS_ORIGIN` 不得为 `*`。
 6. 数据库超时顺序校验（任意环境）：`DB_STATEMENT_TIMEOUT_MS < DB_QUERY_TIMEOUT_MS`（均为 `0` 或单侧 `0` 时跳过比较）。
+7. `JWT_SECRET` 必填且长度 >= 16（不允许默认示例密钥静默上线；缺省会启动失败）。
 
 ## 运行测试
 
 单元测试与 e2e 测试均位于 `test/` 目录，目录结构与 `src/` 对应。
 
 ```bash
-# 单元测试（12 suites · 120 tests）
+# 单元测试（17 suites · 178 tests）
 $ pnpm run test
 
-# e2e 测试（2 suites · 5 tests）——需要先 docker compose up -d 起依赖，
+# e2e 测试（3 suites · 13 tests）——需要先 docker compose up -d 起依赖，
 # 并对测试库执行迁移：pnpm run migration:run:test
 $ pnpm run test:e2e
 
@@ -194,15 +202,46 @@ $ pnpm run lint:check
 CI（`.github/workflows/ci.yml`，Node 24 + pnpm 12.4.2 + `--frozen-lockfile`）在 push/PR 时按顺序执行：
 
 1. **audit**：生产依赖漏洞扫描（`pnpm audit --prod`；已记录的例外：glob CLI 公告仅影响 jest 开发链路，见工作流内注释）；
-2. **lint**：仅检查（check-only，不做 `--fix`）；
+2. **lint**：仅检查（check-only，不做 `--fix`）+ 全量类型检查（`tsc --noEmit`，兜住 ts-jest 转译不查类型、build 排除 test 的盲区）；
 3. **test**：单测 + 覆盖率门槛 + 覆盖率报告上传（artifact 保留 7 天）；
 4. **build**：`pnpm run build`；
 5. **e2e**：真实 PostgreSQL/Redis 容器 + **迁移路径**（`DB_SYNCHRONIZE=false`，与生产一致，先 `migration:run:test` 再启动应用）；
 6. **docker-smoke**：`docker build` 生产镜像 + 以生产配置（无任何 `.env` 文件）启动容器，等待 `/api/health/ready` 就绪。
 
+## 认证接口
+
+认证模块位于 `src/modules/auth/`，注册/登录/刷新/登出四个开放端点 + 一个受保护端点。统一响应信封下，认证失败按 HTTP 语义返回状态码（401/403/409），成功一律 `code: 0`。
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|------|------|------|------|
+| POST | `/api/auth/register` | 开放 | 注册（用户名 + 密码，邮箱/手机号至少其一可选）；**201 + 空响应（不返回用户信息，/me 是唯一资料入口）**；用户名冲突返回 409；限速 5 次/分 |
+| POST | `/api/auth/login` | 开放 | 登录（账号 = 用户名/邮箱/手机号任一，按标识形态路由到单字段查询：含 `@` → 邮箱、纯数字/+ 区号（6-20 位）→ 手机号、其余 → 用户名）；**返回令牌对（不含用户信息，/me 是唯一资料入口）**；失败统一 401；限速 5 次/分 |
+| POST | `/api/auth/refresh` | 开放 | 刷新令牌对（旧 refresh token 轮换撤销，签发新对）；令牌从 Cookie 或 body 二选一；限速 10 次/分 |
+| POST | `/api/auth/logout` | 开放 | 登出（撤销 refresh token + 清 Cookie，幂等——无令牌/已撤销不报错） |
+| GET | `/api/auth/me` | `Authorization: Bearer <accessToken>` | 当前用户信息（示例受保护端点，`JwtAuthGuard`） |
+
+### 双令牌方案（为什么这样设计）
+
+| | access token | refresh token |
+|---|---|---|
+| 载体 | 响应体（客户端放内存） | **httpOnly Cookie**（`SameSite=Lax`、`Path=/api/auth`，覆盖整个认证前缀——收窄到 `/refresh` 会让浏览器登出时带不上 Cookie）+ 响应体同传（移动端无 Cookie 机制用 body 字段） |
+| 有效期 | 15 分钟（`JWT_ACCESS_TTL_SECONDS`） | 7 天（`JWT_REFRESH_TTL_SECONDS`） |
+| 存储 | 无状态（JWT 载荷仅 `sub`，不存库） | DB 只存 **SHA-256 哈希**（`refresh_tokens` 表），明文仅签发时返回一次 |
+| 撤销 | 天然过期（短 TTL）**+ 即时封禁**（`JwtAuthGuard` 每个受保护请求查库复查用户状态——账号被禁用/删除后旧 access 令牌立即失效，不依赖 TTL 过期） | 刷新即轮换（旧令牌写 `revokedAt`），登出/重放检测即时失效 |
+
+要点：access token 短命且无状态，泄露窗口小；refresh token 进 httpOnly Cookie（JS 无法**直接读取** Cookie），路径限定在刷新端点减少暴露面；每次刷新都轮换，已被使用过的旧令牌再次出现一律 401（防重放）。**注意响应体同时回传明文 refresh token（移动端/无 Cookie 客户端契约）——HttpOnly 防的是"JS 读 Cookie"，XSS 脚本仍可主动调用刷新接口并从 JSON 响应读取新令牌**；浏览器端前端代码应忽略该字段（不读取、不存储），真正防线是同源策略 + 无 CORS 暴露 + CSP（见[已知取舍](#已知取舍)）。轮换的"撤销旧令牌 + 落库新令牌"在**单个数据库事务**内原子完成——新令牌落库失败（如数据库抖动）时整体回滚，旧令牌保持有效可重试，不会出现"旧令牌已撤销、新令牌未落库"而被迫重新登录。
+
+### 安全设计
+
+- **密码**：bcrypt 哈希（cost 10），不存盐（bcrypt 盐内嵌于哈希串）。**无密码账号（`password_hash` 为 NULL，第三方登录通道预留）不可用密码登录**——即便口令恰好是固定哑哈希的明文，也因 `password_hash` 为空被显式拒绝。
+- **防枚举**：登录失败统一"账号或密码错误"（响应层再统一为"未登录或登录已失效"的 401 文案）；注册冲突不区分具体字段；用户不存在/无密码账号也执行假密码比对，避免响应时长泄露账号是否存在；登录超长口令（>72 字节，bcrypt 截断上限）同样统一 401 而非顶部抛 400——快速 400 会泄露处理路径差异。
+- **即时封禁**：`JwtAuthGuard` 每个受保护请求查库复查用户状态（与 refresh 链路同语义）——账号被禁用/软删后，已签发的 access 令牌立即失效，无需等待 15 分钟 TTL 自然过期。
+- **限速**：注册/登录 5 次/分、刷新 10 次/分（`@Throttle` 装饰器，计数存储随 `THROTTLE_STORAGE` 切换）。
+- **日志**：登录成功/失败/注册写结构化 pino 日志（`event: auth.login.success/failed/register`，含 userId/IP/UA）；审计落库在后续阶段（login_logs 与 audit_logs 同生共管）。
+
 ## 数据层与迁移
 
-- **PostgreSQL**：主数据库，经 `@nestjs/typeorm`（TypeORM）连接，配置在 `src/config` 的 `database` 命名空间（`DB_*` 变量）。实体通过特性模块 `TypeOrmModule.forFeature([...])` 注册（示例见后续认证/RBAC 模块）。
+- **PostgreSQL**：主数据库，经 `@nestjs/typeorm`（TypeORM）连接，配置在 `src/config` 的 `database` 命名空间（`DB_*` 变量）。实体通过特性模块 `TypeOrmModule.forFeature([...])` 注册（示例见 `src/modules/auth/auth.module.ts` 的 User / RefreshToken）。
 - **Redis**：全局缓存层（`src/redis` 的 `RedisService`，JSON 序列化 + 键前缀 + 失败降级），同时承载限速计数存储（`THROTTLE_STORAGE=redis`，多副本共享限额）。
 - **迁移**：CLI 与运行时共用 `src/database/data-source.ts` → `buildTypeOrmOptions`，保证两侧配置一致（迁移场景 statement/query 超时显式置 0，避免长 DDL 被中断，锁等待与整体部署超时由专项变量控制）。
 
@@ -237,10 +276,12 @@ docker/.env.prod      只给"生产 compose 插值"用，应用不读它；
 
 ### Migration 工作流
 
-仓库当前**尚无迁移文件**（`src/database/migrations` 为空目录，git 不跟踪空目录）；模板默认 `DB_SYNCHRONIZE=false`，本地原型期如需自动建表，把 `.env` 的 `DB_SYNCHRONIZE` 改为 `true`（生产环境为 true 会直接启动失败）。需要固化变更时：
+仓库已有**首个迁移** `InitAuth`（`users` + `refresh_tokens` 表，见 `src/database/migrations/`）；
+用户名/邮箱/手机号的唯一性用**局部唯一索引**（`WHERE deleted_at IS NULL`，软删行不占用标识——注销后标识可重新注册）；
+`DB_SYNCHRONIZE` 已全面关闭（`.env` / `.env.test` / 生产均 `false`），schema 变更一律走迁移。新增/修改实体后：
 
 ```bash
-# 修改实体后生成迁移（对比实体与数据库 schema，只产出差异 SQL；TypeORM 自动创建目录）
+# 修改实体后生成迁移（对比实体与数据库 schema，只产出差异 SQL）
 $ pnpm run migration:generate src/database/migrations/XxxDescription
 # 执行 / 回滚最近一次
 $ pnpm run migration:run
@@ -249,7 +290,9 @@ $ pnpm run migration:revert
 $ pnpm run migration:run:test
 ```
 
-生成首个迁移后，把 `.env` / `.env.test` 的 `DB_SYNCHRONIZE` 改回 `false`，之后一律走 migration。
+> 注意：`migration:generate` 与 `migration:run` 走 `NODE_ENV=development`（连 `.env` 的 `nest_dev` 库），
+> e2e 走测试库 `nest_test`。CI 的 e2e 在 `DB_SYNCHRONIZE=false` 下先 `migration:run:test` 再启动应用，
+> 保证每次提交都真实验证迁移路径。
 
 ## 健康检查与可观测性
 
@@ -302,7 +345,7 @@ $ docker compose -f docker/docker-compose.prod.yml --env-file docker/.env.prod u
 
 ## API 文档
 
-开发环境启用 Swagger 后访问 `/api/docs`：
+开发环境启用 Swagger 后访问 `/api/docs`（受保护端点如 `/api/auth/me` 带 🔒 标记：点击页面右上角 **Authorize** 按钮，粘贴 `Authorization: Bearer <accessToken>` 后可在线调试）：
 
 ```bash
 # .env 中设置 SWAGGER_ENABLED=true 后重启
@@ -312,12 +355,25 @@ $ pnpm run start:dev
 
 > 生产环境 `SWAGGER_ENABLED` 被启动校验强制为 `false`，接口文档不会暴露。
 
+**通用接口约定**（属于基本认知，不在每个端点的 Responses 区重复标注）：
+
+- `401`：所有受保护接口（挂 `JwtAuthGuard`）在未携带令牌或令牌失效时返回，登录失败同样统一 401（文案不分"账号不存在/密码错误"，防枚举）。
+- `429`：触发限速时返回。全局窗口由 `THROTTLE_TTL` / `THROTTLE_LIMIT` 配置；认证接口另有接口级收紧（注册/登录 5 次/分、刷新 10 次/分）。
+- Swagger 每个端点的 Responses 区只标注**接口特有**的状态码与响应体形状（成功信封 + `data` 结构、注册的 `409` 等），通用 401/429 见本节。
+
 ## 已知取舍
 
 - **许可证**：`package.json` 声明 **UNLICENSED**（内部/私有模板，保留所有权利，无 LICENSE 文件）；复制/分发前请先与项目所有者确认授权。底层框架 [Nest](https://github.com/nestjs/nest) 采用 [MIT 许可证](https://github.com/nestjs/nest/blob/master/LICENSE)。
 - **业务异常 HTTP 200**：为保证国内业务码惯例与历史契约，业务失败不映射 4xx/409；可观测性已用响应头 + 日志补偿。若未来需要严格 REST 语义，属破坏性变更，需统一评估。
-- **Swagger 响应装饰器**：当前无业务端点，接口文档只描述请求形状，统一响应信封未加 `@ApiResponse` 装饰器；落地真实端点时建议加共享装饰器。
+- **Swagger 响应装饰器**：共享工厂在 `src/common/swagger/api-response.decorator.ts`（`ApiOkEnvelope` / `ApiCreatedEnvelope` / `ApiConflictResponse`），统一信封已文档化到认证端点的 Responses；401/429 属通用契约（见「通用接口约定」）不在每个端点标注。新增业务端点时复用成功装饰器 + 接口特有失败装饰器。
+- **登录标识按形态路由**：登录时账号按形态判定为邮箱（含 `@`）/手机号（纯数字或 `+` 区号开头，6-20 位）/用户名（其余）后单字段查询——避免"某标识同时是 A 的用户名与 B 的手机号"时 OR 查询命中多行、绑定不可预期。由于 6-20 位纯数字会被当作手机号，注册校验已直接拒绝这类用户名。注册端仍有跨字段冲突检查 + 唯一索引兜底。
+- **refresh token 响应体回传（双通道契约）**：HttpOnly Cookie 是浏览器通道；响应体同时回传明文 refresh token 供移动端/无 Cookie 客户端使用。代价：存在 XSS 时，脚本可调用刷新接口并从 JSON 响应读取新令牌（HttpOnly 只阻止"直接读 Cookie"）。缓解：前端代码不得读取/存储该字段、CORS 收紧（不暴露接口给第三方源）、CSP 降低注入面。若确认只服务浏览器，可在 `auth.controller.ts` 的 `setRefreshCookie` 后不返回 `refreshToken` 字段并移除 body 通道（`RefreshDto.refreshToken` 随之弃用）——属破坏性契约变更，需统一评估。
+- **refresh token 轮换并发**：同一 refresh token 被并发请求共用时，后到者必然 401（旧令牌已被轮换撤销）。前端刷新需做 single-flight（合并并发刷新请求为一次）；无宽限期的选择是刻意的——可降低令牌被盗重放的窗口。
+- **refresh_tokens 只增不清**：当前仅靠 7 天 TTL + 登出撤销，过期/已撤销行暂由 `idx_refresh_tokens_expires` 索引兜底，尚未挂 cron 清理；同一用户会话数也无上限。属后续阶段（审计/会话管理）落地项。
+- **密码哈希用原生 `bcrypt`（非 bcryptjs）**：bcryptjs 是纯 JS 实现，同 cost 下比原生慢数倍且全部计算占用主线程（其"异步"是分片让出式）；原生 `bcrypt` 走 libuv 线程池，主线程几乎零负担。代价是原生依赖：`pnpm` 需在 `pnpm-workspace.yaml` 的 `allowBuilds` 放行其构建脚本，Docker 镜像依赖官方 musl prebuilt。`argon2` 是更现代的 KDF（内存硬、抗 GPU/ASIC），若未来需要可迁移。
 - **开发环境默认弱密码**（`pg_dev_password` / `redis_dev_password`）：仅存在于 dev compose 与 `.env.example`，生产模板要求强密码且缺失即拒启。
+- **会话版本号（管理端踢人预留）**：`users.session_version` 已进首个迁移（默认 0）。设计：签发 access token 时把版本写入 JWT payload，`JwtAuthGuard` 每请求比对（与现有"每请求复查用户状态"同一次查库），不一致即 401——管理端"强制下线" = 版本 +1，该用户所有已签发 access token 立即失效（无状态 JWT 无法主动撤销，靠版本比对实现即时生效）。当前仅 schema 预留，不对外暴露（不在 `SafeUser`）；踢人逻辑在管理端（RBAC）阶段实现。
+- **首个发布前迁移允许就地改写**：`InitAuth` 在首个发布前被就地改写（局部唯一索引），因为确认没有任何持久环境应用过旧版；**此后 schema 变更必须追加新迁移**，且 `migration:revert` 只对当前 DDL 有效——不要修改已提交/已应用过的迁移文件。
 
 ## 相关资源
 
