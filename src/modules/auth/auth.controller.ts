@@ -3,6 +3,7 @@ import {
   Controller,
   Get,
   HttpCode,
+  Patch,
   Post,
   Req,
   Res,
@@ -25,6 +26,7 @@ import { AuthService, type SafeUser, type TokenPair } from './auth.service';
 import { LoginDto } from './dto/login.dto';
 import { RefreshDto } from './dto/refresh.dto';
 import { RegisterDto } from './dto/register.dto';
+import { UpdateMeDto } from './dto/update-me.dto';
 import { type AuthenticatedRequest, JwtAuthGuard } from './jwt-auth.guard';
 
 /** refresh token 的 httpOnly Cookie 名（登录/刷新/登出三处共用同一常量） */
@@ -98,6 +100,18 @@ const SAFE_USER_SCHEMA: SchemaObject = {
       description: '手机号验证时间',
     },
     status: { type: 'string', description: '账号状态', example: 'active' },
+    roles: {
+      type: 'array',
+      items: { type: 'string' },
+      description: '角色码列表（前端导航/角色展示用）',
+      example: ['admin'],
+    },
+    permissions: {
+      type: 'array',
+      items: { type: 'string' },
+      description: '权限码并集（前端按钮级控制用）；admin 返回全量权限码',
+      example: ['user:read', 'user:delete'],
+    },
     createdAt: { type: 'string', format: 'date-time', description: '创建时间' },
     updatedAt: { type: 'string', format: 'date-time', description: '更新时间' },
   },
@@ -199,6 +213,22 @@ export class AuthController {
   @UseGuards(JwtAuthGuard)
   me(@Req() req: AuthenticatedRequest): Promise<SafeUser> {
     return this.authService.me(req.user.id);
+  }
+
+  /**
+   * 自助修改个人资料：只允许资料字段（昵称/性别/生日/头像）。
+   * 登录标识（用户名/邮箱/手机号）不可自助修改——标识变更依赖验证流程
+   * （后续阶段）；管理端改他人资料走 PATCH /api/users/:id（user:update）。
+   */
+  @ApiBearerAuth()
+  @ApiOkEnvelope('更新成功，返回最新用户信息', SAFE_USER_SCHEMA)
+  @Patch('me')
+  @UseGuards(JwtAuthGuard)
+  updateMe(
+    @Req() req: AuthenticatedRequest,
+    @Body() dto: UpdateMeDto,
+  ): Promise<SafeUser> {
+    return this.authService.updateMe(req.user.id, dto);
   }
 
   /** refresh token 解析顺序：Cookie 优先，body 兜底（移动端无 Cookie） */

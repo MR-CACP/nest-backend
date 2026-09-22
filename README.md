@@ -36,7 +36,7 @@
 
 ## 项目简介
 
-面向新手学习与二次开发的 NestJS 后端模板。默认提供**基础设施能力**（配置、日志、限速、统一响应、健康检查、数据库/缓存接入）与**认证模块**（注册/登录/刷新/登出/当前用户），RBAC、审计等业务模块按需在 `src/modules/` 下扩展。
+面向新手学习与二次开发的 NestJS 后端模板。默认提供**基础设施能力**（配置、日志、限速、统一响应、健康检查、数据库/缓存接入）、**认证模块**（注册/登录/刷新/登出/当前用户）与 **RBAC 权限体系**（角色/权限/分配关系 + 声明式守卫），审计等业务模块按需在 `src/modules/` 下扩展。
 
 ## 核心特性
 
@@ -48,6 +48,7 @@
 - **限速**：`@nestjs/throttler`，计数存储可切换内存 / Redis（多副本共享）。
 - **数据层**：TypeORM（PostgreSQL）连接池、SSL/超时/迁移专项配置；Redis 缓存门面（JSON 序列化 + 键前缀 + 失败降级）。
 - **健康检查**：`/health/live`（进程存活）与 `/health/ready`（依赖就绪，各 2s 超时）分离，容器探针语义正确。
+- **RBAC**：`roles / permissions / user_roles / role_permissions` 四表 + 种子角色（`admin` 旁路、`user`）；`@Roles` / `@Permissions` 声明式守卫，**每请求查库 → 角色/权限变更即时生效**（详见[RBAC 权限体系](#rbac-权限体系)）。
 - **CI**：GitHub Actions 6 项检查（见[运行测试](#运行测试)），含 Docker 镜像构建 + 生产配置 smoke。
 
 ## 技术栈
@@ -81,15 +82,19 @@ src/
 │   ├── utils/               # api-response（统一响应）、request-id（日志关联）、error-messages（中文校验消息）
 │   ├── exceptions/          # BusinessException（业务异常契约）
 │   ├── filters/             # AllExceptionsFilter（统一错误响应 + 可观测性补偿）
-│   └── interceptors/        # TransformInterceptor（成功响应包装）
+│   ├── interceptors/        # TransformInterceptor（成功响应包装）
+│   ├── constants/           # rbac.constants（ADMIN_ROLE_CODE 系统角色码，与迁移种子强同步）
+│   └── decorators/          # rbac.decorator（@Roles/@Permissions + 元数据键，纯共享件）
 ├── config/                  # types（类型定义）/ env.validation（Joi 校验 + 安全策略）/ configuration（命名空间工厂）
 ├── database/                # database.module（运行时连接）/ data-source.ts（TypeORM CLI 迁移专用）
 ├── modules/
-│   └── auth/                # 认证模块：User / RefreshToken 实体 + 注册/登录/刷新/登出/me（JWT + Cookie 双令牌）
+│   ├── auth/                # 认证模块：User / RefreshToken 实体 + 注册/登录/刷新/登出/me（JWT + Cookie 双令牌）
+│   ├── rbac/                # RBAC 模块：实体 + RolesGuard + RbacService/RbacController（角色/权限管理端接口）
+│   └── users/               # 用户管理模块：/api/users 列表/创建/资料/状态/角色分配（用户资源上的管理操作）
 ├── redis/                   # redis.service（缓存门面）/ redis.module（客户端构建，超时选项纯函数）
 └── health/                  # health.controller（live/ready/check）+ health.module
 
-test/                        # 测试目录，结构与 src/ 对应（17 单测 suite + 3 e2e suite）
+test/                        # 测试目录，结构与 src/ 对应（23 单测 suite + 6 e2e suite）
 ```
 
 ## 快速开始
@@ -185,10 +190,10 @@ $ pnpm run format             # Prettier 格式化
 单元测试与 e2e 测试均位于 `test/` 目录，目录结构与 `src/` 对应。
 
 ```bash
-# 单元测试（17 suites · 178 tests）
+# 单元测试（23 suites · 254 tests）
 $ pnpm run test
 
-# e2e 测试（3 suites · 13 tests）——需要先 docker compose up -d 起依赖，
+# e2e 测试（6 suites · 26 tests）——需要先 docker compose up -d 起依赖，
 # 并对测试库执行迁移：pnpm run migration:run:test
 $ pnpm run test:e2e
 
@@ -219,6 +224,7 @@ CI（`.github/workflows/ci.yml`，Node 24 + pnpm 12.4.2 + `--frozen-lockfile`）
 | POST | `/api/auth/refresh` | 开放 | 刷新令牌对（旧 refresh token 轮换撤销，签发新对）；令牌从 Cookie 或 body 二选一；限速 10 次/分 |
 | POST | `/api/auth/logout` | 开放 | 登出（撤销 refresh token + 清 Cookie，幂等——无令牌/已撤销不报错） |
 | GET | `/api/auth/me` | `Authorization: Bearer <accessToken>` | 当前用户信息（示例受保护端点，`JwtAuthGuard`） |
+| PATCH | `/api/auth/me` | `Authorization: Bearer <accessToken>` | 自助修改个人资料（昵称/性别/生日/头像；**登录标识与状态不可自助修改**，返回最新用户信息） |
 
 ### 双令牌方案（为什么这样设计）
 
@@ -238,6 +244,74 @@ CI（`.github/workflows/ci.yml`，Node 24 + pnpm 12.4.2 + `--frozen-lockfile`）
 - **即时封禁**：`JwtAuthGuard` 每个受保护请求查库复查用户状态（与 refresh 链路同语义）——账号被禁用/软删后，已签发的 access 令牌立即失效，无需等待 15 分钟 TTL 自然过期。
 - **限速**：注册/登录 5 次/分、刷新 10 次/分（`@Throttle` 装饰器，计数存储随 `THROTTLE_STORAGE` 切换）。
 - **日志**：登录成功/失败/注册写结构化 pino 日志（`event: auth.login.success/failed/register`，含 userId/IP/UA）；审计落库在后续阶段（login_logs 与 audit_logs 同生共管）。
+
+## RBAC 权限体系
+
+模块位于 `src/modules/rbac/`，四张表 + 声明式守卫，提供"角色 → 权限"两级授权：
+
+| 表 | 说明 |
+|---|---|
+| `roles` | 角色（`code` 唯一）；`is_system` 标记系统内置角色 |
+| `permissions` | 权限点（`code` 唯一，命名如 `user:delete`） |
+| `user_roles` | 用户-角色关联（`userId` + `roleId` 复合唯一） |
+| `role_permissions` | 角色-权限关联（`roleId` + `permissionId` 复合唯一） |
+
+种子（迁移 `InitRbac` 幂等插入，`is_system=true`）：`admin`（超管，**旁路**：拥有任意角色即拥有全部权限，新权限点无需手动分配给超管）与 `user`（普通用户，**注册不自动分配**，由管理员按需分配）。系统角色不允许修改/删除（管理端接口落地时校验）。
+
+### 用法
+
+```ts
+// 控制器：声明式授权（RolesGuard 与 JwtAuthGuard 配合，先认证后授权）
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Get('admin-only')
+@Roles('admin')                 // 或 @Permissions('user:delete')
+adminOnly() { return { ok: true }; }
+```
+
+- `@Roles('admin')`：用户拥有该角色码即放行（任一命中即可，多角色用数组）。
+- `@Permissions('user:delete')`：用户任意角色绑定了该权限码即放行（admin 旁路）。
+- `/api/auth/me` 返回 `roles: string[]` 与 `permissions: string[]`（admin 为全量权限码），供前端做菜单/按钮级控制。
+
+### 管理端接口
+
+角色 / 权限 / 用户分配（全部需登录 + 权限点授权；`admin` 旁路自动拥有全部）：
+
+| 方法 | 路径 | 权限点 | 说明 |
+|---|---|---|---|
+| GET | `/api/roles` | `role:read` | 角色列表（含权限码） |
+| POST | `/api/roles` | `role:create` | 创建角色（code 唯一，冲突 409） |
+| PATCH | `/api/roles/:id` | `role:update` | 改名称/描述（**code 不可改**——它是 `@Roles` 的代码引用；系统角色 403） |
+| DELETE | `/api/roles/:id` | `role:delete` | 删除（系统角色 403；仍有关联用户 409） |
+| PUT | `/api/roles/:id/permissions` | `role:assign-permission` | 整体替换角色权限（系统角色 403） |
+| GET | `/api/permissions` | `role:read` | 权限点列表（只读，按分组） |
+| GET | `/api/users` | `user:read` | 用户分页列表（含角色码）（UsersModule） |
+| POST | `/api/users` | `user:create` | 创建用户（管理员代建；校验/规范化/哈希与注册一致，创建后即可登录；标识冲突 409）（UsersModule） |
+| PATCH | `/api/users/:id` | `user:update` | 更新用户资料（昵称/姓名/性别/生日/头像/备注；**不含登录标识与状态**）（UsersModule） |
+| PATCH | `/api/users/:id/status` | `user:disable` | 修改状态 active/disabled/banned；**非 active 即撤销该用户全部活跃会话**（UsersModule） |
+| PUT | `/api/users/:id/roles` | `user:assign-role` | 整体替换用户角色（空数组 = 清空）（UsersModule） |
+
+要点：
+- **模块归属**：`/api/users*` 归 UsersModule（用户资源上的管理操作：列表/创建/资料/状态/角色分配），
+  RbacModule 只管 `/roles`、`/permissions` 与角色-权限绑定；权限点常量仍在 `rbac.constants.ts`（代码侧唯一真源）；
+- **改状态即终止会话**：`PATCH /api/users/:id/status` 置为非 active 时，服务层同时撤销该用户全部活跃 refresh token（`revokedAt` 条件更新，幂等）——"禁用"是终止会话而非暂停，恢复 active 后旧会话不复存在、必须重新登录；access token 最长 15 分钟窗口内仍有效（无状态 JWT 的已知取舍）；
+- **权限点不做 CRUD，只做登记与展示**：权限点由代码声明（`PERMISSION_CODES` 常量 + `@Permissions` 引用），管理端只能读列表给角色分配——新增权限点 = 常量加一行 + 迁移种子加一行（见 `InitRbacPermissions`），避免"动态权限点"与代码脱节（建了没人用 / 删了守卫悬空）；
+- **系统角色完全只读**：`is_system=true`（admin/user）PATCH/DELETE/改权限一律 403——改 code 会破坏 `@Roles('admin')` 引用，改权限绑定与守卫旁路语义冲突；
+- **分配用整体替换**（先清后插，同一事务）：空数组 = 清空，不出现增量增删的状态漂移；
+- **提权防护（管理权限不能自我提升）**：分配角色/权限的目标必须是**操作者自己已有集**的子集
+  （admin 旁路例外）——持有 `user:assign-role` 的人不能把 admin 角色分配给自己/他人，
+  持有 `role:assign-permission` 的人不能给自己所在角色绑它没有的权限点；
+  操作者集合即时查库（与"每请求查库"模型一致），不依赖令牌内快照；
+- **降级防护（内部人不能锁死系统）**：非 admin 操作者不得变更持有 admin 角色的账号（角色/状态）；
+  **最后 admin 保护**——admin（旁路）也不能移除/禁用**唯一活跃管理员**（403「不能移除最后一个管理员」），
+  防止管理员被清空后系统无人可管；判定与变更在**同一事务**内执行，并以 `SELECT ... FOR UPDATE`
+  锁 admin 角色行——两个 admin 并发互移/互禁时串行化，后到者读到变更后的真实数量（防竞态锁死）；
+- **管理端遵循 REST 语义**（404/403/409），与认证端"HTTP 200 + 业务码"刻意区分——内部工具需要精确的状态语义。
+
+### 设计要点
+
+- **每请求查库 → 即时生效**：`JwtAuthGuard` 每请求复查用户状态，`RolesGuard` 每请求查角色/权限，不做 JWT 角色快照。管理员改角色/权限后**同一 access token 立即生效**（最长 15 分钟 TTL 的会话无需重新登录）；代价是每个权限接口多 2–3 条主键/关联查询（普通接口零增加——`JwtAuthGuard` 按 handler 元数据决定是否预加载 RBAC 关系）。
+- **踢人预留**：`users.session_version` + `refresh_tokens` 撤销记录，管理端"强制下线"落地时递增版本号即可使旧令牌失效（详见[已知取舍](#已知取舍)）。
+- **审计口径**：`users` 表的用户名/邮箱/手机号是**局部唯一索引**（软删行不占标识但旧行保留），管理端/客服按标识查用户必须显式带 `deleted_at IS NULL`，写操作一律以主键 `id` 定位（避免命中历史软删行）。
 
 ## 数据层与迁移
 
@@ -276,7 +350,7 @@ docker/.env.prod      只给"生产 compose 插值"用，应用不读它；
 
 ### Migration 工作流
 
-仓库已有**首个迁移** `InitAuth`（`users` + `refresh_tokens` 表，见 `src/database/migrations/`）；
+仓库已有四个迁移（见 `src/database/migrations/`）：**`InitAuth`**（`users` + `refresh_tokens` 表）、**`InitRbac`**（`roles` / `permissions` / `user_roles` / `role_permissions` 四表 + 种子角色 `admin` / `user`，幂等插入）、**`InitRbacPermissions`**（管理端 7 个权限点种子：`role:read` / `role:create` / `role:update` / `role:delete` / `role:assign-permission` / `user:read` / `user:assign-role`，幂等插入）与 **`InitUserPermissions`**（用户管理 3 个权限点：`user:create` / `user:update` / `user:disable`，幂等插入）；
 用户名/邮箱/手机号的唯一性用**局部唯一索引**（`WHERE deleted_at IS NULL`，软删行不占用标识——注销后标识可重新注册）；
 `DB_SYNCHRONIZE` 已全面关闭（`.env` / `.env.test` / 生产均 `false`），schema 变更一律走迁移。新增/修改实体后：
 

@@ -5,9 +5,13 @@ import {
   DeleteDateColumn,
   Entity,
   Index,
+  JoinTable,
+  ManyToMany,
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
+
+import { Role } from '../../rbac/entities/role.entity';
 
 /**
  * 用户实体（users 表）：平台自有身份的主数据。
@@ -111,6 +115,19 @@ export class User {
    */
   @Column({ name: 'session_version', type: 'int', default: 0 })
   sessionVersion: number;
+
+  /**
+   * 用户角色（经 user_roles 连接表，多对多）：RBAC 权限判定的数据来源。
+   * RolesGuard 每请求加载 roles.permissions 做授权；/me 返回角色码与权限码并集。
+   * 关系加载自动过滤软删角色（Role 实体有 @DeleteDateColumn）。
+   */
+  @ManyToMany(() => Role, (role) => role.users)
+  @JoinTable({
+    name: 'user_roles',
+    joinColumn: { name: 'user_id', referencedColumnName: 'id' },
+    inverseJoinColumn: { name: 'role_id', referencedColumnName: 'id' },
+  })
+  roles: Role[];
 
   /** 创建时间（TypeORM 自动填充） */
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })

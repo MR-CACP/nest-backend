@@ -48,6 +48,17 @@ export class AllExceptionsFilter implements ExceptionFilter {
       this.logger.warn(
         `[业务异常] ${request.method} ${request.path} -> code=${code} ${message}`,
       );
+    } else if (
+      // PG 类型转换错误：非数字 ID 打到 bigint（roles/users 的 :id 与 In(ids)）——
+      // 22P02 invalid_text_representation 本应是 400 参数错误，不能让框架兜成 500
+      typeof exception === 'object' &&
+      exception !== null &&
+      'code' in exception &&
+      (exception as { code?: string }).code === '22P02'
+    ) {
+      status = HttpStatus.BAD_REQUEST;
+      code = status;
+      message = '请求参数格式不正确';
     } else if (exception instanceof HttpException) {
       status = exception.getStatus();
       code = status;

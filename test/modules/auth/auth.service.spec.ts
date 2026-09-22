@@ -21,6 +21,7 @@ import {
 import { AuthService } from '@/modules/auth/auth.service';
 import { RefreshToken } from '@/modules/auth/entities/refresh-token.entity';
 import { User } from '@/modules/auth/entities/user.entity';
+import { Permission } from '@/modules/rbac/entities/permission.entity';
 
 // bcrypt 计算昂贵且耗时不可控，单测中 mock 为确定性实现。
 // 用 jest.Mock 而非 jest.MockedFunction：bcrypt 的泛型/重载会让
@@ -58,6 +59,7 @@ describe('AuthService', () => {
   let service: AuthService;
   let users: jest.Mocked<UserRepo>;
   let refreshTokens: jest.Mocked<TokenRepo>;
+  let permissions: { find: jest.Mock };
   let jwtService: { signAsync: jest.Mock };
   let configService: { getOrThrow: jest.Mock };
   let logger: { info: jest.Mock; warn: jest.Mock };
@@ -80,6 +82,7 @@ describe('AuthService', () => {
     phoneVerifiedAt: null,
     status: 'active',
     sessionVersion: 0,
+    roles: [],
     createdAt: new Date('2026-01-01T00:00:00Z'),
     updatedAt: new Date('2026-01-01T00:00:00Z'),
     remark: null,
@@ -100,6 +103,7 @@ describe('AuthService', () => {
       create: jest.fn(),
       update: jest.fn(),
     };
+    permissions = { find: jest.fn() };
     jwtService = { signAsync: jest.fn() };
     configService = {
       getOrThrow: jest.fn((key: string): unknown =>
@@ -131,12 +135,15 @@ describe('AuthService', () => {
     service = new AuthService(
       users as unknown as Repository<User>,
       refreshTokens as unknown as Repository<RefreshToken>,
+      permissions as unknown as Repository<Permission>,
       jwtService as unknown as JwtService,
       configService as unknown as ConfigService,
       logger as unknown as PinoLogger,
       dataSource as unknown as DataSource,
     );
 
+    // admin 旁路会查全量权限码：默认空数组，具体用例按需覆盖
+    permissions.find.mockResolvedValue([]);
     mockedHash.mockResolvedValue('hashed:secret123');
     mockedCompare.mockResolvedValue(true);
     jwtService.signAsync.mockResolvedValue('signed-access-token');
@@ -533,18 +540,128 @@ describe('AuthService', () => {
       expect(refreshTokens.update).not.toHaveBeenCalled();
     });
 
-    it('me：返回安全字段', async () => {
-      users.findOneBy.mockResolvedValue(makeUser());
+    it('me：返回安全字段 + RBAC 角色/权限', async () => {
+      // me 现在用 findOne（带 roles.permissions 关系加载），findOneBy 不再被调用
+      users.findOne.mockResolvedValue(
+        makeUser({
+          roles: [
+            {
+              id: '1',
+              code: 'admin',
+              name: 'x',
+              isSystem: true,
+              permissions: [],
+              createdAt: new Date(),
+              updatedAt: new Date(),
+              deletedAt: null,
+              users: [],
+              description: null,
+            },
+          ],
+        }),
+      );
       const result = await service.me('1');
       expect(result.id).toBe('1');
       expect(result).not.toHaveProperty('passwordHash');
+      expect(result.roles).toContain('admin');
+    });
+
+    it('me：普通角色返回权限码并集（去重）', async () => {
+      users.findOne.mockResolvedValue(
+        makeUser({
+          roles: [
+            {
+              id: '2',
+              code: 'editor',
+              name: 'x',
+              isSystem: false,
+              permissions: [
+                {
+                  id: '1',
+                  code: 'user:read',
+                  name: 'x',
+                  group: null,
+                  description: null,
+                  createdAt: new Date(),
+                  roles: [],
+                },
+                {
+                  id: '2',
+                  code: 'user:delete',
+                  name: 'x',
+                  group: null,
+                  description: null,
+                  createdAt: new Date(),
+                  roles: [],
+                },
+              ],
+              createdAt: new Date(),
+              updatedAt: new Date(),
+              deletedAt: null,
+              users: [],
+              description: null,
+            },
+          ],
+        }),
+      );
+      const result = await service.me('1');
+      expect(result.roles).toEqual(['editor']);
+      expect(result.permissions.sort()).toEqual(['user:delete', 'user:read']);
+    });
+
+    it('me：admin 角色返回全量权限码（旁路）', async () => {
+      users.findOne.mockResolvedValue(
+        makeUser({
+          roles: [
+            {
+              id: '1',
+              code: 'admin',
+              name: 'x',
+              isSystem: true,
+              permissions: [],
+              createdAt: new Date(),
+              updatedAt: new Date(),
+              deletedAt: null,
+              users: [],
+              description: null,
+            },
+          ],
+        }),
+      );
+      permissions.find.mockResolvedValue([
+        { code: 'user:read' },
+        { code: 'user:delete' },
+      ]);
+      const result = await service.me('1');
+      expect(result.roles).toEqual(['admin']);
+      expect(result.permissions).toEqual(['user:read', 'user:delete']);
     });
 
     it('me：用户不存在（已被删除）→ 401', async () => {
-      users.findOneBy.mockResolvedValue(null);
+      users.findOne.mockResolvedValue(null);
       await expect(service.me('999')).rejects.toBeInstanceOf(
         UnauthorizedException,
       );
+    });
+
+    it('updateMe：只落传入字段，返回最新资料（含 RBAC）', async () => {
+      users.findOneBy.mockResolvedValue(makeUser({ nickname: '旧昵称' }));
+      users.save.mockResolvedValue(makeUser({ nickname: '新昵称' }));
+      // updateMe 内部重查（me 路径）：findOne 返回带 roles/permissions 的完整用户
+      users.findOne.mockResolvedValue(makeUser({ nickname: '新昵称' }));
+      const result = await service.updateMe('1', { nickname: '新昵称' });
+      expect(users.save).toHaveBeenCalledWith(
+        expect.objectContaining({ nickname: '新昵称' }),
+      );
+      expect(result.nickname).toBe('新昵称');
+      expect(result.roles).toEqual([]);
+    });
+
+    it('updateMe：用户不存在 → 401', async () => {
+      users.findOneBy.mockResolvedValue(null);
+      await expect(
+        service.updateMe('999', { nickname: 'x' }),
+      ).rejects.toBeInstanceOf(UnauthorizedException);
     });
   });
 });

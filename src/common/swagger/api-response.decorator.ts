@@ -13,6 +13,8 @@ export interface SchemaObject {
   description?: string;
   example?: unknown;
   nullable?: boolean;
+  /** 数组元素 schema（type: 'array' 时使用） */
+  items?: SchemaObject;
   properties?: Record<string, SchemaObject>;
   required?: string[];
 }

@@ -1,7 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 
 import {
-  BadRequestException,
   ConflictException,
   Injectable,
   UnauthorizedException,
@@ -9,21 +8,30 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { InjectRepository } from '@nestjs/typeorm';
-import { compare, hash } from 'bcrypt';
+import { compare } from 'bcrypt';
 import { PinoLogger } from 'nestjs-pino';
 import {
   DataSource,
   EntityManager,
   FindOptionsWhere,
   IsNull,
-  QueryFailedError,
   Repository,
 } from 'typeorm';
 
+import { ADMIN_ROLE_CODE } from '../../common/constants/rbac.constants';
 import { BusinessException } from '../../common/exceptions/business.exception';
+import {
+  assertPasswordByteLength,
+  hashPassword,
+  isUniqueViolation,
+  normalizeEmail,
+  normalizePhone,
+} from '../../common/utils/account';
 import type { JwtConfig } from '../../config/types';
+import { Permission } from '../rbac/entities/permission.entity';
 import type { LoginDto } from './dto/login.dto';
 import type { RegisterDto } from './dto/register.dto';
+import type { UpdateMeDto } from './dto/update-me.dto';
 import { RefreshToken } from './entities/refresh-token.entity';
 import { User } from './entities/user.entity';
 
@@ -58,7 +66,12 @@ export type SafeUser = Pick<
   | 'status'
   | 'createdAt'
   | 'updatedAt'
->;
+> & {
+  /** 角色码列表（前端导航/角色展示用；来自 user_roles 关系） */
+  roles: string[];
+  /** 权限码并集（去重，前端按钮级控制用）；admin 角色返回全量权限码（旁路） */
+  permissions: string[];
+};
 
 /**
  * 登录/刷新成功后的令牌对。
@@ -89,6 +102,9 @@ export class AuthService {
     private readonly users: Repository<User>,
     @InjectRepository(RefreshToken)
     private readonly refreshTokens: Repository<RefreshToken>,
+    // RBAC：/me 的 admin 全量权限码查询（表小，见 toSafeUserWithRbac）
+    @InjectRepository(Permission)
+    private readonly permissions: Repository<Permission>,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
     private readonly logger: PinoLogger,
@@ -102,15 +118,15 @@ export class AuthService {
    * @returns 无返回（201 + 空 data）；用户资料由登录后 /me 获取，注册响应不承载用户信息
    */
   async register(dto: RegisterDto): Promise<void> {
-    this.assertPasswordByteLength(dto.password);
+    assertPasswordByteLength(dto.password);
     await this.ensureAccountAvailable(dto);
-    const passwordHash = await hash(dto.password, 10); // cost 10：约 50-100ms，抗 GPU 爆破
+    const passwordHash = await hashPassword(dto.password);
     const user = await this.saveUserSafely({
       username: dto.username,
       // 规范化：邮箱小写、手机号去分隔符——PG varchar 大小写敏感，
       // 不规范化会出现 Alice@x.com 与 alice@x.com 两个账号
-      email: this.normalizeEmail(dto.email),
-      phone: this.normalizePhone(dto.phone),
+      email: normalizeEmail(dto.email),
+      phone: normalizePhone(dto.phone),
       passwordHash,
     });
     this.logger.info({ event: 'auth.register', userId: user.id }, '用户注册');
@@ -267,11 +283,38 @@ export class AuthService {
    * @returns 安全用户信息；用户已被删除时 401
    */
   async me(userId: string): Promise<SafeUser> {
+    const user = await this.users.findOne({
+      where: { id: userId },
+      // 角色 + 角色权限一起加载，组装 /me 的 roles/permissions
+      relations: { roles: { permissions: true } },
+    });
+    if (!user) {
+      throw new UnauthorizedException('用户不存在');
+    }
+    return this.toSafeUserWithRbac(user);
+  }
+
+  /**
+   * 自助修改个人资料：只落传入字段（undefined 不覆盖），返回最新用户信息。
+   * 不允许改登录标识与状态（DTO 已限定字段）。
+   * @param userId 当前用户 ID（访问令牌载荷）
+   * @param dto 资料字段（全可选）
+   * @returns 更新后的安全用户信息
+   */
+  async updateMe(userId: string, dto: UpdateMeDto): Promise<SafeUser> {
     const user = await this.users.findOneBy({ id: userId });
     if (!user) {
       throw new UnauthorizedException('用户不存在');
     }
-    return this.toSafeUser(user);
+    Object.assign(user, {
+      nickname: dto.nickname,
+      gender: dto.gender,
+      birthDate: dto.birthDate,
+      avatarUrl: dto.avatarUrl,
+    });
+    const saved = await this.users.save(user);
+    // 重查 roles/permissions（save 返回不带关系）：与 /me 同一组装路径
+    return this.me(saved.id);
   }
 
   /**
@@ -287,9 +330,9 @@ export class AuthService {
    */
   private accountWhere(account: string): FindOptionsWhere<User> {
     if (account.includes('@')) {
-      return { email: this.normalizeEmail(account) ?? undefined };
+      return { email: normalizeEmail(account) ?? undefined };
     }
-    const phone = this.normalizePhone(account);
+    const phone = normalizePhone(account);
     if (phone && /^\+?\d{6,20}$/.test(phone)) {
       return { phone };
     }
@@ -307,10 +350,10 @@ export class AuthService {
       where: [
         { username: dto.username },
         ...(dto.email
-          ? [{ email: this.normalizeEmail(dto.email) ?? undefined }]
+          ? [{ email: normalizeEmail(dto.email) ?? undefined }]
           : []),
         ...(dto.phone
-          ? [{ phone: this.normalizePhone(dto.phone) ?? undefined }]
+          ? [{ phone: normalizePhone(dto.phone) ?? undefined }]
           : []),
       ],
     });
@@ -325,19 +368,11 @@ export class AuthService {
     try {
       return await this.users.save(this.users.create(input));
     } catch (err) {
-      if (this.isUniqueViolation(err)) {
+      if (isUniqueViolation(err)) {
         throw new ConflictException('用户名、邮箱或手机号已被占用');
       }
       throw err;
     }
-  }
-
-  /** 是否为 PostgreSQL 唯一约束冲突（SQLSTATE 23505） */
-  private isUniqueViolation(err: unknown): boolean {
-    return (
-      err instanceof QueryFailedError &&
-      (err.driverError as { code?: string } | undefined)?.code === '23505'
-    );
   }
 
   /**
@@ -388,23 +423,6 @@ export class AuthService {
     return createHash('sha256').update(rawToken).digest('hex');
   }
 
-  /** bcrypt 只处理前 72 字节：超长（如 72 个汉字=216 字节）会被静默截断，直接拒绝 */
-  private assertPasswordByteLength(password: string): void {
-    if (Buffer.byteLength(password, 'utf8') > 72) {
-      throw new BadRequestException('密码过长（不能超过 72 字节）');
-    }
-  }
-
-  /** 邮箱规范化：小写（PG varchar 大小写敏感，避免同邮箱双账号） */
-  private normalizeEmail(email: string | undefined): string | null {
-    return email ? email.trim().toLowerCase() : null;
-  }
-
-  /** 手机号规范化：去空格/连字符（保留可选 + 区号前缀） */
-  private normalizePhone(phone: string | undefined): string | null {
-    return phone ? phone.replace(/[\s-]/g, '') : null;
-  }
-
   /**
    * 登录标识日志脱敏：邮箱/手机号是 PII，不落明文日志
    * （与异常过滤器"query 不入日志"同一立场，见 all-exceptions.filter.ts）。
@@ -417,7 +435,7 @@ export class AuthService {
     }
     // 先规范化再去分隔符判定：原始输入可能含空格/连字符（如 '+86 138-0013-8000'），
     // 直接对原始串匹配会失败、把 PII 明文写进日志
-    const normalized = this.normalizePhone(account);
+    const normalized = normalizePhone(account);
     if (normalized && /^\+?\d{6,20}$/.test(normalized)) {
       return normalized.length > 7
         ? `${normalized.slice(0, 3)}****${normalized.slice(-4)}`
@@ -426,8 +444,33 @@ export class AuthService {
     return account;
   }
 
-  /** 显式挑选对外字段，杜绝 passwordHash/deletedAt 外泄 */
-  private toSafeUser(user: User): SafeUser {
+  /**
+   * 组装 /me 响应：基础字段 + RBAC 角色/权限。
+   * admin 旁路时返回全量权限码（permissions 表只有几十行，代价可忽略）——
+   * 前端按 permissions.includes(code) 控制按钮，无需特判 admin 角色。
+   */
+  private async toSafeUserWithRbac(user: User): Promise<SafeUser> {
+    const base = this.toSafeUser(user);
+    const roles = user.roles ?? [];
+    const roleCodes = roles.map((role) => role.code);
+    let permissions: string[];
+    if (roleCodes.includes(ADMIN_ROLE_CODE)) {
+      const all = await this.permissions.find({ select: { code: true } });
+      permissions = all.map((permission) => permission.code);
+    } else {
+      const permissionSet = new Set<string>();
+      for (const role of roles) {
+        for (const permission of role.permissions ?? []) {
+          permissionSet.add(permission.code);
+        }
+      }
+      permissions = [...permissionSet];
+    }
+    return { ...base, roles: roleCodes, permissions };
+  }
+
+  /** 显式挑选对外基础字段（不含 RBAC 与敏感列）；roles/permissions 由 toSafeUserWithRbac 组装 */
+  private toSafeUser(user: User): Omit<SafeUser, 'roles' | 'permissions'> {
     return {
       id: user.id,
       username: user.username,

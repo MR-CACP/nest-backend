@@ -27,6 +27,8 @@ import type { NodeEnv, ThrottlerConfig } from './config/types';
 import { DatabaseModule } from './database/database.module';
 import { HealthModule } from './health/health.module';
 import { AuthModule } from './modules/auth/auth.module';
+import { RbacModule } from './modules/rbac/rbac.module';
+import { UsersModule } from './modules/users/users.module';
 import { REDIS_CLIENT } from './redis/redis.constants';
 import { RedisModule } from './redis/redis.module';
 
@@ -129,6 +131,12 @@ const nodeEnv = (process.env.NODE_ENV ?? 'development') as NodeEnv;
     HealthModule,
     // 认证模块：本阶段注册 User / RefreshToken 数据模型（实体见 src/modules/auth/entities）
     AuthModule,
+    // RBAC 权限体系：roles/permissions 数据模型 + RolesGuard 授权守卫
+    // （接口用 @UseGuards(JwtAuthGuard, RolesGuard) + @Roles/@Permissions 声明）
+    RbacModule,
+    // 用户管理模块：/api/users（列表 + 角色分配）；用户域接口归此模块，
+    // 与 rbac 的 /roles、/permissions 分工
+    UsersModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },

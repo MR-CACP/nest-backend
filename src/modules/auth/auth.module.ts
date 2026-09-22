@@ -4,6 +4,7 @@ import { JwtModule, type JwtModuleOptions } from '@nestjs/jwt';
 import { TypeOrmModule } from '@nestjs/typeorm';
 
 import type { JwtConfig } from '../../config/types';
+import { Permission } from '../rbac/entities/permission.entity';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { RefreshToken } from './entities/refresh-token.entity';
@@ -33,7 +34,7 @@ export function buildJwtModuleOptions(
  */
 @Module({
   imports: [
-    TypeOrmModule.forFeature([User, RefreshToken]),
+    TypeOrmModule.forFeature([User, RefreshToken, Permission]),
     JwtModule.registerAsync({
       inject: [ConfigService],
       useFactory: buildJwtModuleOptions,
@@ -41,5 +42,8 @@ export function buildJwtModuleOptions(
   ],
   controllers: [AuthController],
   providers: [AuthService, JwtAuthGuard],
+  // 导出 JwtModule：其他模块/测试中的控制器若直接使用 JwtAuthGuard，
+  // 需要 JwtService 在解析链上可用（否则 Nest 报 "can't resolve JwtService"）
+  exports: [JwtAuthGuard, JwtModule],
 })
 export class AuthModule {}
