@@ -55,14 +55,17 @@ export class JwtAuthGuard implements CanActivate {
     // 只捕获令牌异常：verifyAsync 失败（无效/过期/签名不符）才是"登录失效"。
     // 数据库查询异常（断连/超时）不能在这里吞掉——错误转换会误导客户端
     // 去刷新/清会话，同时掩盖服务故障；让它原样抛出，由全局过滤器转成 500/503
-    let payload: { sub?: unknown };
+    let payload: { sub?: unknown; sessionVersion?: unknown };
     try {
-      payload = await this.jwtService.verifyAsync<{ sub?: unknown }>(token);
+      payload = await this.jwtService.verifyAsync<{
+        sub?: unknown;
+        sessionVersion?: unknown;
+      }>(token);
     } catch {
       throw new UnauthorizedException('登录已过期，请重新登录');
     }
-    // 载荷最小化：只签 sub（userId），其余用户信息按需查库，
-    // 避免角色/状态变更后旧令牌仍携带过期权限信息。
+    // 载荷最小化：只签 sub（userId）+ sessionVersion（踢出/禁用即时失效的版本比对），
+    // 其余用户信息（角色/权限/状态）一律按需查库——避免变更后旧令牌携带过期信息。
     // sub 缺失/非字符串（异常签发方或损坏令牌）视为无效而非 500：
     // 携带 undefined 查库会退化为无条件的全表首行，属于越权读取
     if (typeof payload.sub !== 'string' || payload.sub.length === 0) {
@@ -89,6 +92,13 @@ export class JwtAuthGuard implements CanActivate {
       : await this.users.findOneBy({ id: payload.sub });
     if (!user || user.status !== 'active') {
       throw new UnauthorizedException('账号不可用，请重新登录');
+    }
+    // 会话版本校验：强制下线（SessionsService.revokeAllByUser 递增 session_version）后，
+    // 旧 access token 即使未过期也立即失效——"踢出"即时生效，不依赖 15 分钟窗口。
+    // 旧实现签发的令牌无此字段（undefined !== 当前版本）→ 一律重新登录；
+    // 开发期无存量令牌，无兼容成本（README「已知取舍」记录）。
+    if (payload.sessionVersion !== user.sessionVersion) {
+      throw new UnauthorizedException('登录已失效，请重新登录');
     }
     request.user = { id: payload.sub };
     request.userEntity = user;

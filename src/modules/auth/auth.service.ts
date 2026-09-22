@@ -15,6 +15,7 @@ import {
   EntityManager,
   FindOptionsWhere,
   IsNull,
+  LessThan,
   Repository,
 } from 'typeorm';
 
@@ -192,7 +193,30 @@ export class AuthService {
       throw new BusinessException('账号已被禁用', ACCOUNT_DISABLED_BIZ_CODE);
     }
 
-    const tokens = await this.issueTokenPair(undefined, user.id, ip, userAgent);
+    const tokens = await this.issueTokenPair(
+      undefined,
+      user.id,
+      ip,
+      userAgent,
+      user.sessionVersion,
+    );
+    // 惰性清理：登录成功后删除该用户全部已过期行——revoked_at IS NULL 且已过期的行
+    // 不再算在线（在线判定已排除）；已撤销但未过期的行保留（"已轮换令牌再次出现"的
+    // 盗用检测依赖撤销记录）。只按过期收敛，不删未过期的撤销行，自然遏制 refresh_tokens
+    // 的只增不清（无界增长）。
+    // **尽力而为**：清理失败只记 warn 不阻断登录——令牌已签发、refresh 行已落库，
+    // 登录语义已完整；DELETE 抛错直接传播会让客户端收到 500 并重试登录，产生第二个会话
+    try {
+      await this.refreshTokens.delete({
+        userId: user.id,
+        expiresAt: LessThan(new Date()),
+      });
+    } catch (error) {
+      this.logger.warn(
+        { event: 'auth.login.cleanupFailed', userId: user.id, error },
+        '登录成功但惰性清理失败（过期 refresh 行暂未收敛）',
+      );
+    }
     this.logger.info(
       { event: 'auth.login.success', userId: user.id, ip, userAgent },
       '用户登录成功',
@@ -208,8 +232,10 @@ export class AuthService {
    * 并发共用同一令牌时只有先撤销成功者能续期，后到者 401（README"后到者必然 401"成立）；
    * "撤销 + 落库新令牌"原子提交——落库失败整体回滚，旧令牌保持有效可重试，不会出现
    * "旧令牌已撤销、新令牌未落库"导致被迫重登的窗口。
-   * 注意执行顺序：先查用户并校验状态，再撤销/签发——令牌落库前失败不会留下
-   * revoked_at IS NULL 的孤儿会话；被封禁账号也无法通过刷新续期。
+   * 注意执行顺序：事务内**先锁用户行**（SELECT ... FOR UPDATE）并校验状态，再撤销/签发——
+   * 令牌落库前失败不会留下 revoked_at IS NULL 的孤儿会话；被封禁账号也无法通过刷新续期；
+   * 锁用户行同时与 revokeAllByUser（全部下线）完全串行（见事务内注释），
+   * 消除"批量撤销提交后新 refresh 行复活会话"的并发竞态。
    * @param rawToken 明文 refresh token（浏览器走 Cookie，移动端走 body）
    * @param ip 客户端 IP
    * @param userAgent 客户端 UA
@@ -224,27 +250,38 @@ export class AuthService {
     if (!token) {
       throw new UnauthorizedException('刷新令牌无效或已过期');
     }
-    // 先查用户：令牌有效但用户已被删除（软删）→ 直接 401
-    const user = await this.users.findOneBy({ id: token.userId });
-    if (!user) {
-      throw new UnauthorizedException('用户不存在');
-    }
-    if (user.status !== 'active') {
-      throw new BusinessException('账号已被禁用', ACCOUNT_DISABLED_BIZ_CODE);
-    }
     // 轮换 = 单个事务里的 compare-and-swap：
-    // ① 撤销条件带 revokedAt IS NULL 且必须恰好影响 1 行——并发请求共用同一 refresh token 时，
-    //    前置 findOneBy 都会读到"未撤销"而通过检查，只有先撤销成功者能续期，后到者
-    //    update affected=0 → 401（README 的"后到者必然 401"因此成立）；同时避免第二次
-    //    update 把首次轮换时刻往后刷（审计时间被重写）；
-    // ② "撤销旧令牌 + 落库新令牌"必须同生共死：若撤销成功而新令牌落库失败（DB 抖动），
-    //    事务整体回滚——旧令牌保持有效，客户端可直接重试刷新；否则会出现"旧令牌已撤销、
-    //    新令牌未落库"，用户被迫重新登录。
+    // ① **先锁用户行**（SELECT ... FOR UPDATE）：与 revokeAllByUser（全部下线，同样
+    //    锁用户行）完全串行——消除并发竞态。若不做此锁，全部下线事务"批量撤销 + 版本+1"
+    //    提交后，本事务可能已通过前置检查并 CAS 撤销旧行，落库的新 refresh 行不在
+    //    批量撤销范围内（INSERT 发生在撤销之后），于是会话复活：新行可再次刷新、
+    //    用新版本签发完整令牌对（旧 access 401 但可再续期一次，"踢出"被绕过）。
+    //    锁后两种交错都收敛：
+    //    · refresh 先提交 → revokeAll 的批量撤销会覆盖新插入的行 → 会话被彻底清除；
+    //    · revokeAll 先提交 → 旧令牌已被撤销，CAS affected=0 → 401。
+    // ② 锁内重查用户：软删（deleted_at IS NULL 默认过滤）→ null → 401；非 active →
+    //    业务 10001；**sessionVersion 必须取锁后最新值**（revokeAll 可能已递增，
+    //    用旧值签发会让新 access 版本失配 401——正确性依赖锁内快照）。
+    // ③ CAS 撤销：条件带 revokedAt IS NULL 且必须恰好影响 1 行——并发请求共用同一
+    //    refresh token 时，只有先撤销成功者能续期，后到者 affected=0 → 401；
+    //    "撤销旧令牌 + 落库新令牌"同生共死：落库失败整体回滚，旧令牌保持有效可重试。
     //    ⚠ 事务内的所有读写都必须走 manager：this.refreshTokens 绑定默认连接，
     //    在事务回调里用它执行 UPDATE 会在独立连接上立即提交、不受回滚保护，
     //    原子性形同虚设——撤销必须经 manager.getRepository 执行。
     // 已轮换令牌再次出现即"可能被盗用"信号，后续盗用检测（撤销该用户全部会话）可挂在这里。
     const tokens = await this.dataSource.transaction(async (manager) => {
+      const lockedUser = await manager
+        .getRepository(User)
+        .createQueryBuilder('u')
+        .setLock('pessimistic_write')
+        .where('u.id = :id', { id: token.userId })
+        .getOne();
+      if (!lockedUser) {
+        throw new UnauthorizedException('用户不存在');
+      }
+      if (lockedUser.status !== 'active') {
+        throw new BusinessException('账号已被禁用', ACCOUNT_DISABLED_BIZ_CODE);
+      }
       const revoked = await manager
         .getRepository(RefreshToken)
         .update(
@@ -254,7 +291,13 @@ export class AuthService {
       if (revoked.affected !== 1) {
         throw new UnauthorizedException('刷新令牌无效或已过期');
       }
-      return this.issueTokenPair(manager, token.userId, ip, userAgent);
+      return this.issueTokenPair(
+        manager,
+        token.userId,
+        ip,
+        userAgent,
+        lockedUser.sessionVersion,
+      );
     });
     // 同上：令牌对不含用户信息，/me 是唯一用户资料入口
     return tokens;
@@ -377,17 +420,25 @@ export class AuthService {
 
   /**
    * 签发访问令牌 + 刷新令牌（刷新令牌落库，返回明文）。
+   * access token 载荷 = { sub, sessionVersion }：
+   * 强制下线（SessionsService.revokeAllByUser）递增 session_version 后，
+   * JwtAuthGuard 每请求比对版本号——旧 access 即时失效（"踢出"不依赖 15 分钟窗口）。
    * @param manager 可选事务管理器：refresh 轮换在事务内调用（撤销+落库原子）；
    *                登录无撤销操作，不传（走默认仓库）。
+   * @param sessionVersion 用户当前会话版本号（users.session_version；登录/刷新时查库取最新值）
    */
   private async issueTokenPair(
     manager: EntityManager | undefined,
     userId: string,
     ip: string,
     userAgent: string,
+    sessionVersion: number,
   ): Promise<Omit<TokenPair, 'user'>> {
     const jwt = this.configService.getOrThrow<JwtConfig>('jwt');
-    const accessToken = await this.jwtService.signAsync({ sub: userId });
+    const accessToken = await this.jwtService.signAsync({
+      sub: userId,
+      sessionVersion,
+    });
     const refreshToken = randomBytes(32).toString('hex'); // 64 字符明文
     const repo = manager?.getRepository(RefreshToken) ?? this.refreshTokens;
     await repo.save(

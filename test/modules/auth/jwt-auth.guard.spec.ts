@@ -13,7 +13,7 @@ describe('JwtAuthGuard', () => {
 
   /** 默认活跃用户（id 与载荷 sub 一致） */
   const makeUser = (overrides: Partial<User> = {}) =>
-    ({ id: '7', status: 'active', ...overrides }) as User;
+    ({ id: '7', status: 'active', sessionVersion: 0, ...overrides }) as User;
 
   /** handler 带 @Roles 元数据 → needsRbac=true（预加载分支） */
   const rbacHandler = () => {
@@ -45,8 +45,27 @@ describe('JwtAuthGuard', () => {
     );
   });
 
+  it('会话版本不匹配（强制下线后旧 access）→ 401', async () => {
+    // 载荷版本 1、库里版本 0：SessionsService.revokeAllByUser 已递增版本号，
+    // 旧 access 即使未过期也即时失效（"踢出"不依赖 15 分钟窗口）
+    jwtService.verifyAsync.mockResolvedValue({ sub: '7', sessionVersion: 1 });
+    users.findOneBy.mockResolvedValue(makeUser()); // sessionVersion: 0
+    const request: { headers?: { authorization?: string }; user?: unknown } = {
+      headers: { authorization: 'Bearer valid.jwt.token' },
+    };
+    const ctx = {
+      switchToHttp: () => ({ getRequest: () => request }),
+      getHandler: () => jest.fn(),
+      getClass: () => class {},
+    } as unknown as ExecutionContext;
+    await expect(guard.canActivate(ctx)).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
+    expect(request.user).toBeUndefined();
+  });
+
   it('合法 Bearer 令牌：解析 sub → 查库校验状态 → 挂到 request.user', async () => {
-    jwtService.verifyAsync.mockResolvedValue({ sub: '7' });
+    jwtService.verifyAsync.mockResolvedValue({ sub: '7', sessionVersion: 0 });
     users.findOneBy.mockResolvedValue(makeUser());
     const request: { headers?: { authorization?: string }; user?: unknown } = {
       headers: { authorization: 'Bearer valid.jwt.token' },
@@ -64,7 +83,7 @@ describe('JwtAuthGuard', () => {
   });
 
   it('账号已被禁用：旧 access 令牌立即失效（即时封禁，不依赖 TTL 过期）', async () => {
-    jwtService.verifyAsync.mockResolvedValue({ sub: '7' });
+    jwtService.verifyAsync.mockResolvedValue({ sub: '7', sessionVersion: 0 });
     users.findOneBy.mockResolvedValue(makeUser({ status: 'disabled' }));
     await expect(
       guard.canActivate(makeContext('Bearer valid')),
@@ -73,7 +92,7 @@ describe('JwtAuthGuard', () => {
   });
 
   it('用户不存在（已删除）：401', async () => {
-    jwtService.verifyAsync.mockResolvedValue({ sub: '7' });
+    jwtService.verifyAsync.mockResolvedValue({ sub: '7', sessionVersion: 0 });
     users.findOneBy.mockResolvedValue(null);
     await expect(
       guard.canActivate(makeContext('Bearer valid')),
@@ -81,7 +100,7 @@ describe('JwtAuthGuard', () => {
   });
 
   it('数据库故障（断连/超时）：原样抛出，不伪装成"登录已过期"（避免误导客户端刷新/清会话、掩盖服务故障）', async () => {
-    jwtService.verifyAsync.mockResolvedValue({ sub: '7' });
+    jwtService.verifyAsync.mockResolvedValue({ sub: '7', sessionVersion: 0 });
     users.findOneBy.mockRejectedValue(new Error('connection refused'));
     await expect(
       guard.canActivate(makeContext('Bearer valid')),
@@ -109,7 +128,7 @@ describe('JwtAuthGuard', () => {
   });
 
   it('接口声明 @Roles：预加载 roles.permissions（findOne + relations）并挂 userEntity', async () => {
-    jwtService.verifyAsync.mockResolvedValue({ sub: '7' });
+    jwtService.verifyAsync.mockResolvedValue({ sub: '7', sessionVersion: 0 });
     const userWithRbac = makeUser({
       roles: [{ id: 'r1', code: 'admin', permissions: [] }] as never,
     });

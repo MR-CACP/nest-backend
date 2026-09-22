@@ -28,6 +28,7 @@ import { DatabaseModule } from './database/database.module';
 import { HealthModule } from './health/health.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { RbacModule } from './modules/rbac/rbac.module';
+import { SessionsModule } from './modules/sessions/sessions.module';
 import { UsersModule } from './modules/users/users.module';
 import { REDIS_CLIENT } from './redis/redis.constants';
 import { RedisModule } from './redis/redis.module';
@@ -137,6 +138,8 @@ const nodeEnv = (process.env.NODE_ENV ?? 'development') as NodeEnv;
     // 用户管理模块：/api/users（列表 + 角色分配）；用户域接口归此模块，
     // 与 rbac 的 /roles、/permissions 分工
     UsersModule,
+    // 会话管理模块：在线列表 + 强制下线（数据源 refresh_tokens + session_version 递增）
+    SessionsModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },

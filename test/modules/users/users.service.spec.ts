@@ -34,7 +34,8 @@ describe('UsersService', () => {
     delete: jest.Mock;
     insert: jest.Mock;
     update: jest.Mock;
-    save: jest.Mock;
+    /** save 带参数泛型：mock.calls 类型化为 [object][]，杜绝 any 成员访问 */
+    save: jest.Mock<Promise<object>, [object]>;
     findOne: jest.Mock;
     createQueryBuilder: jest.Mock;
   };
@@ -71,7 +72,7 @@ describe('UsersService', () => {
       delete: jest.fn(),
       insert: jest.fn(),
       update: jest.fn(),
-      save: jest.fn(),
+      save: jest.fn<Promise<object>, [object]>(),
       // 锁查询（SELECT ... FOR UPDATE）与 count 都在事务内走 manager 仓库
       findOne: jest.fn(),
       createQueryBuilder: jest.fn(() => txQb),
@@ -362,9 +363,17 @@ describe('UsersService', () => {
           opts.where.id === 'op' ? { id: 'op', roles: [] } : target,
         ),
       );
+    /** 事务内锁查询 mock：目标用户行（按 where.id）返回 target，admin 角色行（按 where.code）返回 adminRole */
+    const mockTxLock = (target: object, adminRole: object | null) =>
+      txRepos.findOne.mockImplementation(
+        (opts: { where: { code?: string; id?: string } }) =>
+          Promise.resolve(opts.where.code ? adminRole : target),
+      );
 
     it('禁用 → 撤销会话且返回管理端投影（passwordHash 不外泄）', async () => {
       mockFindOneBy(fullUser());
+      // 事务内锁目标用户行（SELECT ... FOR UPDATE）→ 基于锁内快照重算
+      mockTxLock(fullUser(), null);
       // 状态保存走事务 manager 仓库（TypeORM 默认仓库不受事务保护）
       txRepos.save.mockImplementation((u: object) => Promise.resolve(u));
       const result = await service.updateUserStatus(
@@ -380,13 +389,37 @@ describe('UsersService', () => {
         { userId: '7', revokedAt: MATCHER_OP_DATE },
         { revokedAt: MATCHER_DATE },
       );
+      // 离开 active：save 前 session_version 已 +1（旧 access 永久失效，
+      // 恢复后也不得复活——仅撤销 refresh 会在恢复后让旧 JWT 重新通过校验）
+      const savedUser = txRepos.save.mock.calls[0][0] as {
+        sessionVersion: number;
+      };
+      expect(savedUser.sessionVersion).toBe(1);
     });
 
-    it('恢复 active 不撤销会话（历史已撤销行保留审计）', async () => {
+    it('恢复 active 不撤销会话、不递增版本（历史已撤销行保留审计）', async () => {
       mockFindOneBy(fullUser({ status: 'disabled' }));
+      mockTxLock(fullUser({ status: 'disabled' }), null);
       txRepos.save.mockImplementation((u: object) => Promise.resolve(u));
       await service.updateUserStatus('7', { status: 'active' }, 'op');
       expect(txRepos.update).not.toHaveBeenCalled();
+      // 恢复不递增：旧 access 已因禁用时递增而永久失效，无需再踢
+      const savedUser = txRepos.save.mock.calls[0][0] as {
+        sessionVersion: number;
+      };
+      expect(savedUser.sessionVersion).toBe(0);
+    });
+
+    it('重复禁用（disabled → disabled）不重复递增（仅离开 active 一次）', async () => {
+      mockFindOneBy(fullUser({ status: 'disabled' }));
+      mockTxLock(fullUser({ status: 'disabled' }), null);
+      txRepos.save.mockImplementation((u: object) => Promise.resolve(u));
+      await service.updateUserStatus('7', { status: 'disabled' }, 'op');
+      const savedUser = txRepos.save.mock.calls[0][0] as {
+        sessionVersion: number;
+      };
+      expect(savedUser.sessionVersion).toBe(0); // 已非 active，不递增
+      expect(txRepos.update).toHaveBeenCalled(); // 幂等撤销仍执行
     });
 
     it('用户不存在 → 404', async () => {
@@ -417,6 +450,10 @@ describe('UsersService', () => {
             : fullUser({ id: '9', roles: [{ id: 'r-admin', code: 'admin' }] }),
         ),
       );
+      mockTxLock(
+        fullUser({ id: '9', roles: [{ id: 'r-admin', code: 'admin' }] }),
+        null,
+      );
       txRepos.save.mockImplementation((u: object) => Promise.resolve(u));
       await service.updateUserStatus('9', { status: 'disabled' }, 'op');
       expect(txRepos.save).toHaveBeenCalled(); // 状态保存走事务 manager 仓库
@@ -430,8 +467,11 @@ describe('UsersService', () => {
             : fullUser({ id: '9', roles: [{ id: 'r-admin', code: 'admin' }] }),
         ),
       );
-      // 事务内锁查询（SELECT ... FOR UPDATE）返回 admin 角色行
-      txRepos.findOne.mockResolvedValue({ id: 'r-admin' });
+      // 事务内锁查询：目标用户行（含 admin 角色）→ 锁 admin 角色行
+      mockTxLock(
+        fullUser({ id: '9', roles: [{ id: 'r-admin', code: 'admin' }] }),
+        { id: 'r-admin' },
+      );
       // 活跃 admin 数 = 1（只有目标自己）→ 拒绝
       (
         txRepos.createQueryBuilder() as unknown as { getCount: jest.Mock }
@@ -446,6 +486,73 @@ describe('UsersService', () => {
       );
     });
 
+    it('并发已递增后仍执行：锁内快照为准，不覆盖新版本', async () => {
+      // 事务外读到旧快照（v0）——但并发（全部下线/另一状态更新）已在事务内读到前递增
+      mockFindOneBy(fullUser());
+      mockTxLock(fullUser({ sessionVersion: 5 }), null);
+      txRepos.save.mockImplementation((u: object) => Promise.resolve(u));
+
+      await service.updateUserStatus('7', { status: 'disabled' }, 'op');
+
+      // 版本基于锁内最新值计算（5 + 1），旧快照的 0 不会覆盖已提交的递增
+      const savedUser = txRepos.save.mock.calls[0][0] as {
+        sessionVersion: number;
+      };
+      expect(savedUser.sessionVersion).toBe(6);
+    });
+
+    it('非 admin 操作者 + 目标并发获得 admin 角色 → 事务内复核 403', async () => {
+      // 事务外快照：目标无 admin 角色 → 快速失败路径放行（非 admin 操作者 + 普通目标）
+      mockFindOneBy(fullUser());
+      // 事务内：锁用户行 → 锁 admin 角色行 → 重读发现目标已是 admin
+      // （授予恰在并发提交）→ 复核 assertNoAdminDowngrade 必须拒绝
+      txRepos.findOne.mockImplementation(
+        (opts: { where: { code?: string; id?: string } }) =>
+          Promise.resolve(
+            opts.where.code
+              ? { id: 'r-admin' }
+              : fullUser({ roles: [{ id: 'r-admin', code: 'admin' }] }),
+          ),
+      );
+
+      await expect(
+        service.updateUserStatus('7', { status: 'disabled' }, 'op'),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      // 未落任何状态/撤销
+      expect(txRepos.save).not.toHaveBeenCalled();
+      expect(txRepos.update).not.toHaveBeenCalled();
+    });
+
+    it('角色并发已变更：降级/最后 admin 判定用事务内重读的最新角色', async () => {
+      // 操作者持 admin；事务外快照：目标无 admin 角色（降级防护放行）
+      users.findOne.mockImplementation((opts: { where: { id: string } }) =>
+        Promise.resolve(
+          opts.where.id === 'op'
+            ? { id: 'op', roles: [{ id: 'r-admin', code: 'admin' }] }
+            : fullUser(),
+        ),
+      );
+      // 事务内重读 roles：目标已是 admin（角色分配恰在并发提交）→ 禁用触发最后 admin 保护；
+      // 若沿用事务外快照（无 admin 角色），assertNotLastAdmin 会提前 return、错误放行
+      txRepos.findOne.mockImplementation(
+        (opts: { where: { code?: string; id?: string } }) =>
+          Promise.resolve(
+            opts.where.code
+              ? { id: 'r-admin' }
+              : fullUser({ roles: [{ id: 'r-admin', code: 'admin' }] }),
+          ),
+      );
+      // 活跃 admin 数 = 1（只有目标自己）→ 拒绝
+      (
+        txRepos.createQueryBuilder() as unknown as { getCount: jest.Mock }
+      ).getCount.mockResolvedValue(1);
+
+      await expect(
+        service.updateUserStatus('7', { status: 'disabled' }, 'op'),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(txRepos.save).not.toHaveBeenCalled();
+    });
+
     it('最后 admin 保护：仍有其他活跃 admin 时放行', async () => {
       users.findOne.mockImplementation((opts: { where: { id: string } }) =>
         Promise.resolve(
@@ -454,7 +561,10 @@ describe('UsersService', () => {
             : fullUser({ id: '9', roles: [{ id: 'r-admin', code: 'admin' }] }),
         ),
       );
-      txRepos.findOne.mockResolvedValue({ id: 'r-admin' });
+      mockTxLock(
+        fullUser({ id: '9', roles: [{ id: 'r-admin', code: 'admin' }] }),
+        { id: 'r-admin' },
+      );
       (
         txRepos.createQueryBuilder() as unknown as { getCount: jest.Mock }
       ).getCount.mockResolvedValue(2);

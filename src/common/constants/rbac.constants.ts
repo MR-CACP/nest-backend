@@ -31,4 +31,8 @@ export const PERMISSION_CODES = {
   USER_UPDATE: 'user:update',
   /** 修改用户状态（active/disabled/banned；非 active 即撤销该用户全部会话） */
   USER_DISABLE: 'user:disable',
+  /** 查看在线会话列表（可按用户筛选） */
+  SESSION_READ: 'session:read',
+  /** 强制下线（单个会话或某用户全部会话） */
+  SESSION_REVOKE: 'session:revoke',
 } as const;

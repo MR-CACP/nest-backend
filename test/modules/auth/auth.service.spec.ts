@@ -10,6 +10,7 @@ import { PinoLogger } from 'nestjs-pino';
 import {
   type DataSource,
   type DeepPartial,
+  type DeleteResult,
   type FindOneOptions,
   FindOperator,
   type FindOptionsWhere,
@@ -34,6 +35,10 @@ jest.mock('bcrypt', () => ({
 const mockedHash = hash as jest.Mock;
 const mockedCompare = compare as jest.Mock;
 
+// expect.anything() 返回 any（@types/jest），直接放进断言触发 no-unsafe-assignment；
+// 包成显式类型占位（值仅用于编译期，断言匹配由 jest 运行时完成）
+const MATCHER_LESS_THAN = expect.anything() as unknown as FindOperator<Date>;
+
 // 显式非泛型签名：Repository.save<T> 是泛型方法，jest.Mocked 会把
 // mockResolvedValue 的参数推断为 never；这里固定 DeepPartial → Entity
 // 使 mock 返回类型可赋值（tsc --noEmit 全量类型闸门的一部分）
@@ -53,6 +58,10 @@ type TokenRepo = {
     criteria: string | FindOptionsWhere<RefreshToken>,
     partial: DeepPartial<RefreshToken>,
   ) => Promise<UpdateResult>;
+  /** 登录惰性清理：删除该用户已过期行（见 AuthService.login 的收敛策略） */
+  delete: (
+    criteria: string | string[] | FindOptionsWhere<RefreshToken>,
+  ) => Promise<DeleteResult>;
 };
 
 describe('AuthService', () => {
@@ -65,6 +74,8 @@ describe('AuthService', () => {
   let logger: { info: jest.Mock; warn: jest.Mock };
   let dataSource: { transaction: jest.Mock };
   let managerRepo: jest.Mocked<TokenRepo>;
+  /** refresh 锁用户行的 User 仓库 mock（createQueryBuilder 链式） */
+  let userManagerRepo: { createQueryBuilder: jest.Mock };
 
   /** 构造一个合法的 User 样本（仅测试用，不触发数据库） */
   const makeUser = (overrides: Partial<User> = {}): User => ({
@@ -102,6 +113,7 @@ describe('AuthService', () => {
       save: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
+      delete: jest.fn(), // 登录惰性清理（删除该用户已过期行）
     };
     permissions = { find: jest.fn() };
     jwtService = { signAsync: jest.fn() };
@@ -125,10 +137,26 @@ describe('AuthService', () => {
       save: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
+      delete: jest.fn(),
+    };
+    // refresh 锁用户行的链：默认 getOne 返回活跃用户（各用例按需覆盖）
+    userManagerRepo = {
+      createQueryBuilder: jest.fn(() => ({
+        setLock: jest.fn(() => ({
+          where: jest.fn(() => ({
+            getOne: jest.fn(() => Promise.resolve(makeUser())),
+          })),
+        })),
+      })),
     };
     dataSource = {
       transaction: jest.fn(async (fn: (m: unknown) => Promise<unknown>) =>
-        fn({ getRepository: () => managerRepo }),
+        fn({
+          // 按实体分流：User 走 userManagerRepo（有 createQueryBuilder），
+          // RefreshToken 走 managerRepo——分别模拟两仓库的真实形状
+          getRepository: (entity: unknown) =>
+            entity === User ? userManagerRepo : managerRepo,
+        }),
       ),
     };
 
@@ -232,7 +260,16 @@ describe('AuthService', () => {
         'test-agent',
       );
 
-      expect(jwtService.signAsync).toHaveBeenCalledWith({ sub: '1' });
+      expect(jwtService.signAsync).toHaveBeenCalledWith({
+        sub: '1',
+        sessionVersion: 0,
+      });
+      // 惰性清理：登录后删除该用户已过期行（遏制 refresh_tokens 无界增长）
+      expect(refreshTokens.delete).toHaveBeenCalledWith({
+        userId: '1',
+        // 实际参数是 LessThan(new Date()) 的 FindOperator，不能匹配 expect.any(Date)
+        expiresAt: MATCHER_LESS_THAN,
+      });
       expect(result.accessToken).toBe('signed-access-token');
       expect(result.refreshToken).toMatch(/^[0-9a-f]{64}$/);
       const saved = refreshTokens.save.mock.calls[0][0] as RefreshToken;
@@ -241,6 +278,24 @@ describe('AuthService', () => {
       expect(saved.userId).toBe('1');
       expect(saved.ip).toHaveLength(45); // 截断而非报错
       expect(saved.expiresAt.getTime()).toBeGreaterThan(Date.now());
+    });
+
+    it('惰性清理失败：登录仍成功（尽力而为，不 500、不产生重试会话）', async () => {
+      users.findOne.mockResolvedValue(makeUser());
+      refreshTokens.save.mockResolvedValue({} as RefreshToken);
+      refreshTokens.delete.mockRejectedValue(new Error('redis down'));
+
+      const result = await service.login(
+        { account: 'alice', password: 'secret123' },
+        '1.1.1.1',
+        'test-agent',
+      );
+
+      expect(result.accessToken).toBe('signed-access-token'); // 主路径不受影响
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ event: 'auth.login.cleanupFailed' }),
+        expect.any(String),
+      );
     });
 
     it('邮箱登录：查询侧 trim + 小写（与入库规范化对称；修复"只小写不 trim，带空格匹配不到"）', async () => {
@@ -401,7 +456,6 @@ describe('AuthService', () => {
       // affected===1：update 必须恰好影响一行，轮换才继续
       managerRepo.update.mockResolvedValue({ affected: 1 } as UpdateResult);
       managerRepo.save.mockResolvedValue({} as RefreshToken);
-      users.findOneBy.mockResolvedValue(makeUser());
 
       const before = Date.now();
       const result = await service.refresh('raw-token', 'ip', 'ua');
@@ -425,13 +479,40 @@ describe('AuthService', () => {
       expect(managerRepo.save).toHaveBeenCalledTimes(1);
       expect(refreshTokens.save).not.toHaveBeenCalled();
       expect(dataSource.transaction).toHaveBeenCalledTimes(1);
-      expect(jwtService.signAsync).toHaveBeenCalledWith({ sub: '1' });
+      // 事务内先锁用户行（SELECT ... FOR UPDATE）：与全部下线串行的关键前置
+      expect(userManagerRepo.createQueryBuilder).toHaveBeenCalledWith('u');
+      // 版本取锁后最新值（默认 mock 返回 sessionVersion: 0）
+      expect(jwtService.signAsync).toHaveBeenCalledWith({
+        sub: '1',
+        sessionVersion: 0,
+      });
+      expect(result.refreshToken).toMatch(/^[0-9a-f]{64}$/);
+    });
+
+    it('锁后版本取最新：revokeAll 已递增时按锁内快照签发', async () => {
+      refreshTokens.findOneBy.mockResolvedValue(activeToken());
+      managerRepo.update.mockResolvedValue({ affected: 1 } as UpdateResult);
+      managerRepo.save.mockResolvedValue({} as RefreshToken);
+      // 模拟全部下线事务已提交（版本已递增）——锁内重查必须拿到新值
+      userManagerRepo.createQueryBuilder.mockImplementation(() => ({
+        setLock: () => ({
+          where: () => ({
+            getOne: () => Promise.resolve(makeUser({ sessionVersion: 7 })),
+          }),
+        }),
+      }));
+
+      const result = await service.refresh('raw-token', 'ip', 'ua');
+
+      expect(jwtService.signAsync).toHaveBeenCalledWith({
+        sub: '1',
+        sessionVersion: 7,
+      });
       expect(result.refreshToken).toMatch(/^[0-9a-f]{64}$/);
     });
 
     it('并发轮换 CAS：update 影响 0 行（已被并发请求撤销）→ 401 且不签发', async () => {
       refreshTokens.findOneBy.mockResolvedValue(activeToken());
-      users.findOneBy.mockResolvedValue(makeUser());
       // 两个并发请求都通过前置检查，后到者 update 匹配不到 revokedAt IS NULL 的行
       managerRepo.update.mockResolvedValue({ affected: 0 } as UpdateResult);
 
@@ -449,7 +530,6 @@ describe('AuthService', () => {
 
     it('轮换原子性：撤销成功但新令牌落库失败 → 异常传播（DB 抖动时整体回滚，旧令牌保持有效）', async () => {
       refreshTokens.findOneBy.mockResolvedValue(activeToken());
-      users.findOneBy.mockResolvedValue(makeUser());
       managerRepo.update.mockResolvedValue({ affected: 1 } as UpdateResult);
       managerRepo.save.mockRejectedValue(new Error('db down'));
 
@@ -468,7 +548,13 @@ describe('AuthService', () => {
 
     it('用户已被禁用：刷新被拒绝，且不撤销/不签发（封禁账号无法续期）', async () => {
       refreshTokens.findOneBy.mockResolvedValue(activeToken());
-      users.findOneBy.mockResolvedValue(makeUser({ status: 'disabled' }));
+      userManagerRepo.createQueryBuilder.mockImplementation(() => ({
+        setLock: () => ({
+          where: () => ({
+            getOne: () => Promise.resolve(makeUser({ status: 'disabled' })),
+          }),
+        }),
+      }));
 
       await expect(
         service.refresh('raw-token', 'ip', 'ua'),
@@ -484,7 +570,13 @@ describe('AuthService', () => {
 
     it('用户已删除：401 且不撤销（同无孤儿会话）', async () => {
       refreshTokens.findOneBy.mockResolvedValue(activeToken());
-      users.findOneBy.mockResolvedValue(null);
+      userManagerRepo.createQueryBuilder.mockImplementation(() => ({
+        setLock: () => ({
+          where: () => ({
+            getOne: () => Promise.resolve(null),
+          }),
+        }),
+      }));
       await expect(
         service.refresh('raw-token', 'ip', 'ua'),
       ).rejects.toBeInstanceOf(UnauthorizedException);

@@ -22,7 +22,7 @@
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
-    "test:e2e": "jest --config ./test/jest-e2e.json",
+    "test:e2e": "jest --config ./test/jest-e2e.json --runInBand",
     "docker:dev": "docker compose up -d",
     "docker:dev:down": "docker compose down",
     "docker:prod": "docker compose -f docker/docker-compose.prod.yml --env-file docker/.env.prod up -d --build",

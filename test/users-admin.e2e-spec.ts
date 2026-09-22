@@ -158,6 +158,12 @@ describe('用户管理 (e2e)', () => {
       .post('/api/auth/login')
       .send({ account: username, password: 'secret123' })
       .expect(200);
+    // 高危回归钉死：禁用前签发的旧 access **永久失效**（离开 active 递增
+    // session_version）——账号已恢复也不能复活旧令牌，必须重新登录
+    await request(app.getHttpServer())
+      .get('/api/auth/me')
+      .set('Authorization', `Bearer ${staffToken}`)
+      .expect(401);
 
     // 管理端列表：新用户可见
     const list = await request(app.getHttpServer())
@@ -365,6 +371,102 @@ describe('用户管理 (e2e)', () => {
       .where('ur.role_id = :rid', { rid: adminRole.id })
       .getCount();
     expect(activeAdmins).toBeGreaterThanOrEqual(1);
+  });
+
+  it('并发状态更新：sessionVersion 不回退，旧 access 永久失效', async () => {
+    const adminToken = await registerAndLogin('adm_cs');
+    const adminMe = await request(app.getHttpServer())
+      .get('/api/auth/me')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .expect(200);
+    const adminId = (adminMe.body as Envelope<{ id: string }>).data.id;
+    await makeAdmin(adminId);
+
+    const targetToken = await registerAndLogin('u_cs');
+    const targetMe = await request(app.getHttpServer())
+      .get('/api/auth/me')
+      .set('Authorization', `Bearer ${targetToken}`)
+      .expect(200);
+    const targetId = (targetMe.body as Envelope<{ id: string }>).data.id;
+    const oldToken = targetToken;
+
+    // 并发：禁用 vs 恢复。修复前两个 PATCH 都基于事务外旧快照计算版本，
+    // 后提交者会用旧版本覆盖先提交者的递增（版本回退 → 旧 access 复活）；
+    // 修复后事务内锁用户行，基于锁内最新版本计算，版本不回退。
+    await Promise.all([
+      request(app.getHttpServer())
+        .patch(`/api/users/${targetId}/status`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ status: 'disabled' })
+        .expect(200),
+      request(app.getHttpServer())
+        .patch(`/api/users/${targetId}/status`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ status: 'active' })
+        .expect(200),
+    ]);
+
+    // 至少一次"离开 active"已递增版本且未被回退 → 旧 access 必须 401
+    await request(app.getHttpServer())
+      .get('/api/auth/me')
+      .set('Authorization', `Bearer ${oldToken}`)
+      .expect(401);
+  });
+
+  it('全部下线与改状态并发：版本不回退，旧会话彻底失效', async () => {
+    const adminToken = await registerAndLogin('adm_ck');
+    const adminMe = await request(app.getHttpServer())
+      .get('/api/auth/me')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .expect(200);
+    const adminId = (adminMe.body as Envelope<{ id: string }>).data.id;
+    await makeAdmin(adminId);
+
+    // 行内注册+登录拿完整令牌对（本 spec 的 registerAndLogin 只返回 access）
+    const username = `u_ck_${suffix()}`;
+    await request(app.getHttpServer())
+      .post('/api/auth/register')
+      .send({ username, password: 'secret123' })
+      .expect(201);
+    const login = await request(app.getHttpServer())
+      .post('/api/auth/login')
+      .send({ account: username, password: 'secret123' })
+      .expect(200);
+    const tokens = (
+      login.body as Envelope<{
+        accessToken: string;
+        refreshToken: string;
+      }>
+    ).data;
+    const targetMe = await request(app.getHttpServer())
+      .get('/api/auth/me')
+      .set('Authorization', `Bearer ${tokens.accessToken}`)
+      .expect(200);
+    const targetId = (targetMe.body as Envelope<{ id: string }>).data.id;
+
+    // 并发：全部下线（版本+1） vs 改状态禁用（版本+1，锁内重算）。
+    // 修复前全部下线提交后，改状态若用旧快照 save 会把版本覆盖回去。
+    await Promise.all([
+      request(app.getHttpServer())
+        .delete(`/api/users/${targetId}/sessions`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200),
+      request(app.getHttpServer())
+        .patch(`/api/users/${targetId}/status`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ status: 'disabled' })
+        .expect(200),
+    ]);
+
+    // 版本已递增且未回退：旧 access 永久失效，旧 refresh 也不能再续期
+    await request(app.getHttpServer())
+      .get('/api/auth/me')
+      .set('Authorization', `Bearer ${tokens.accessToken}`)
+      .expect(401);
+    await request(app.getHttpServer())
+      .post('/api/auth/refresh')
+      .send({ refreshToken: tokens.refreshToken })
+      .expect(401);
   });
 
   it('未认证 → 401；用户不存在 → 404；非数字 ID → 400', async () => {

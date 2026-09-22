@@ -94,7 +94,7 @@ src/
 ├── redis/                   # redis.service（缓存门面）/ redis.module（客户端构建，超时选项纯函数）
 └── health/                  # health.controller（live/ready/check）+ health.module
 
-test/                        # 测试目录，结构与 src/ 对应（23 单测 suite + 6 e2e suite）
+test/                        # 测试目录，结构与 src/ 对应（25 单测 suite + 7 e2e suite）
 ```
 
 ## 快速开始
@@ -190,11 +190,13 @@ $ pnpm run format             # Prettier 格式化
 单元测试与 e2e 测试均位于 `test/` 目录，目录结构与 `src/` 对应。
 
 ```bash
-# 单元测试（23 suites · 254 tests）
+# 单元测试（25 suites · 276 tests）
 $ pnpm run test
 
-# e2e 测试（6 suites · 26 tests）——需要先 docker compose up -d 起依赖，
+# e2e 测试（7 suites · 34 tests）——需要先 docker compose up -d 起依赖，
 # 并对测试库执行迁移：pnpm run migration:run:test
+# 注意：test:e2e 固定 --runInBand 串行执行（suite 间共享同一测试库，
+# 并行时 7 个 app 实例并发写库会偶发瞬时超时/连接竞争导致 flaky 失败，串行消除）
 $ pnpm run test:e2e
 
 # 测试覆盖率（阈值：语句 65% / 分支 78% / 函数 60% / 行 65%，见 package.json）
@@ -232,7 +234,7 @@ CI（`.github/workflows/ci.yml`，Node 24 + pnpm 12.4.2 + `--frozen-lockfile`）
 |---|---|---|
 | 载体 | 响应体（客户端放内存） | **httpOnly Cookie**（`SameSite=Lax`、`Path=/api/auth`，覆盖整个认证前缀——收窄到 `/refresh` 会让浏览器登出时带不上 Cookie）+ 响应体同传（移动端无 Cookie 机制用 body 字段） |
 | 有效期 | 15 分钟（`JWT_ACCESS_TTL_SECONDS`） | 7 天（`JWT_REFRESH_TTL_SECONDS`） |
-| 存储 | 无状态（JWT 载荷仅 `sub`，不存库） | DB 只存 **SHA-256 哈希**（`refresh_tokens` 表），明文仅签发时返回一次 |
+| 存储 | 无状态（JWT 载荷仅 `sub` + `sessionVersion`——版本号供踢出/禁用即时失效比对，不存库） | DB 只存 **SHA-256 哈希**（`refresh_tokens` 表），明文仅签发时返回一次 |
 | 撤销 | 天然过期（短 TTL）**+ 即时封禁**（`JwtAuthGuard` 每个受保护请求查库复查用户状态——账号被禁用/删除后旧 access 令牌立即失效，不依赖 TTL 过期） | 刷新即轮换（旧令牌写 `revokedAt`），登出/重放检测即时失效 |
 
 要点：access token 短命且无状态，泄露窗口小；refresh token 进 httpOnly Cookie（JS 无法**直接读取** Cookie），路径限定在刷新端点减少暴露面；每次刷新都轮换，已被使用过的旧令牌再次出现一律 401（防重放）。**注意响应体同时回传明文 refresh token（移动端/无 Cookie 客户端契约）——HttpOnly 防的是"JS 读 Cookie"，XSS 脚本仍可主动调用刷新接口并从 JSON 响应读取新令牌**；浏览器端前端代码应忽略该字段（不读取、不存储），真正防线是同源策略 + 无 CORS 暴露 + CSP（见[已知取舍](#已知取舍)）。轮换的"撤销旧令牌 + 落库新令牌"在**单个数据库事务**内原子完成——新令牌落库失败（如数据库抖动）时整体回滚，旧令牌保持有效可重试，不会出现"旧令牌已撤销、新令牌未落库"而被迫重新登录。
@@ -290,10 +292,28 @@ adminOnly() { return { ok: true }; }
 | PATCH | `/api/users/:id/status` | `user:disable` | 修改状态 active/disabled/banned；**非 active 即撤销该用户全部活跃会话**（UsersModule） |
 | PUT | `/api/users/:id/roles` | `user:assign-role` | 整体替换用户角色（空数组 = 清空）（UsersModule） |
 
+会话管理（在线列表 + 强制下线；SessionsModule，权限点 `session:read` / `session:revoke`）：
+
+| 方法 | 路径 | 权限点 | 说明 |
+|---|---|---|---|
+| GET | `/api/sessions` | `session:read` | 在线会话分页列表（`page`/`pageSize`/`userId`/`username` 筛选；"在线" = refresh 行未撤销且未过期） |
+| DELETE | `/api/sessions/:id` | `session:revoke` | 强制下线单个会话（撤销该 refresh 行；不存在/已下线 404） |
+| DELETE | `/api/users/:id/sessions` | `session:revoke` | 强制下线某用户全部会话（撤销全部 + `session_version` +1 → 旧 access 即时失效） |
+
+要点：
+- **"在线"的定义**：access token 是无状态 JWT，服务端不追踪；`refresh_tokens` 活跃行（`revoked_at IS NULL` 且 `expires_at > now`）是唯一可靠的会话载体——登录落库、刷新轮换、登出/下线写撤销时间；
+- **两段式踢出**：撤销 refresh 行让"刷新"立即失效；递增 `session_version`（已签进 access payload，`JwtAuthGuard` 每请求比对）让旧 access **即时**失效（不等 15 分钟窗口）——两者在同一事务内，缺一不可（只撤销会留 access 窗口，只递增会留下可刷新的会话）；
+- **能力边界（单会话下线）**：`DELETE /api/sessions/:id` 走"最小影响"取舍——只撤销该会话的 refresh 行、**不**递增 `session_version`，因此该用户**已签发的 access token 仍存活最长 15 分钟**（无状态 JWT 窗口）。只有"全部下线"（`/api/users/:id/sessions`）即时掐断 access。若产品期望"单会话下线也即时失效"，需改为递增版本号（代价：同一用户其他会话的 access 一并失效），当前实现不支持；
+- **软删用户的会话**：`list` 的 join 对带 `@DeleteDateColumn` 的用户自动追加 `deleted_at IS NULL`，软删用户的活跃会话**不出现在**在线列表（TypeORM 语义，已有 e2e 钉死防升级漂移）；其刷新链路也已被 `refresh` 的用户查询过滤拦截（401）。软删是 UPDATE、不触发 `refresh_tokens` 的 DB 级 CASCADE，残留行由登录惰性清理按过期收敛；
+- **登录惰性清理**：登录成功时顺带删除该用户已过期行（不删未过期的撤销行——"已轮换令牌再次出现"的盗用检测依赖撤销记录），零额外依赖地遏制 `refresh_tokens` 只增不清；清理为尽力而为（失败仅记 warn，不阻断登录）；
+- **踢出与刷新的并发安全**：`auth.refresh` 轮换与"全部下线"都以**锁用户行**（SELECT ... FOR UPDATE）为事务前置，两者完全串行——不存在"全部下线提交后，刷新事务插入的新 refresh 行复活会话"的竞态（两种交错都收敛：刷新先提交则批量撤销覆盖新行；全部下线先提交则刷新 CAS 401）；
+- **降级防护（与 users 管理同口径）**：非 admin 操作者**不得下线持有 admin 角色的账号**（403，见 `common/utils/admin-guard.ts` 单一真源）——防止持 `session:revoke` 的人反复踢管理员的骚扰级 DoS；admin 旁路不受限；
+- 列表项为显式投影字段，`tokenHash` 绝不外泄。
+
 要点：
 - **模块归属**：`/api/users*` 归 UsersModule（用户资源上的管理操作：列表/创建/资料/状态/角色分配），
   RbacModule 只管 `/roles`、`/permissions` 与角色-权限绑定；权限点常量仍在 `rbac.constants.ts`（代码侧唯一真源）；
-- **改状态即终止会话**：`PATCH /api/users/:id/status` 置为非 active 时，服务层同时撤销该用户全部活跃 refresh token（`revokedAt` 条件更新，幂等）——"禁用"是终止会话而非暂停，恢复 active 后旧会话不复存在、必须重新登录；access token 最长 15 分钟窗口内仍有效（无状态 JWT 的已知取舍）；
+- **改状态即终止会话**：`PATCH /api/users/:id/status` 置为非 active 时，服务层**在同一事务内**递增 `session_version` + 撤销该用户全部活跃 refresh token（`revokedAt` 条件更新，幂等）——"禁用"是终止会话而非暂停：旧 access 因版本失配**永久失效**（仅撤销 refresh 会在恢复 active 后让旧 JWT 重新通过校验），恢复后必须重新登录；恢复 active 不递增（旧令牌反正已失效）；
 - **权限点不做 CRUD，只做登记与展示**：权限点由代码声明（`PERMISSION_CODES` 常量 + `@Permissions` 引用），管理端只能读列表给角色分配——新增权限点 = 常量加一行 + 迁移种子加一行（见 `InitRbacPermissions`），避免"动态权限点"与代码脱节（建了没人用 / 删了守卫悬空）；
 - **系统角色完全只读**：`is_system=true`（admin/user）PATCH/DELETE/改权限一律 403——改 code 会破坏 `@Roles('admin')` 引用，改权限绑定与守卫旁路语义冲突；
 - **分配用整体替换**（先清后插，同一事务）：空数组 = 清空，不出现增量增删的状态漂移；
@@ -310,7 +330,7 @@ adminOnly() { return { ok: true }; }
 ### 设计要点
 
 - **每请求查库 → 即时生效**：`JwtAuthGuard` 每请求复查用户状态，`RolesGuard` 每请求查角色/权限，不做 JWT 角色快照。管理员改角色/权限后**同一 access token 立即生效**（最长 15 分钟 TTL 的会话无需重新登录）；代价是每个权限接口多 2–3 条主键/关联查询（普通接口零增加——`JwtAuthGuard` 按 handler 元数据决定是否预加载 RBAC 关系）。
-- **踢人预留**：`users.session_version` + `refresh_tokens` 撤销记录，管理端"强制下线"落地时递增版本号即可使旧令牌失效（详见[已知取舍](#已知取舍)）。
+- **踢人已落地**：`session_version` 签进 access payload，`JwtAuthGuard` 每请求比对；`DELETE /api/users/:id/sessions` = 撤销全部活跃 refresh + 版本 +1（同一事务），旧 access 即时失效（见上文会话管理小节与[已知取舍](#已知取舍)）。
 - **审计口径**：`users` 表的用户名/邮箱/手机号是**局部唯一索引**（软删行不占标识但旧行保留），管理端/客服按标识查用户必须显式带 `deleted_at IS NULL`，写操作一律以主键 `id` 定位（避免命中历史软删行）。
 
 ## 数据层与迁移
@@ -350,7 +370,7 @@ docker/.env.prod      只给"生产 compose 插值"用，应用不读它；
 
 ### Migration 工作流
 
-仓库已有四个迁移（见 `src/database/migrations/`）：**`InitAuth`**（`users` + `refresh_tokens` 表）、**`InitRbac`**（`roles` / `permissions` / `user_roles` / `role_permissions` 四表 + 种子角色 `admin` / `user`，幂等插入）、**`InitRbacPermissions`**（管理端 7 个权限点种子：`role:read` / `role:create` / `role:update` / `role:delete` / `role:assign-permission` / `user:read` / `user:assign-role`，幂等插入）与 **`InitUserPermissions`**（用户管理 3 个权限点：`user:create` / `user:update` / `user:disable`，幂等插入）；
+仓库已有五个迁移（见 `src/database/migrations/`）：**`InitAuth`**（`users` + `refresh_tokens` 表）、**`InitRbac`**（`roles` / `permissions` / `user_roles` / `role_permissions` 四表 + 种子角色 `admin` / `user`，幂等插入）、**`InitRbacPermissions`**（管理端 7 个权限点种子：`role:read` / `role:create` / `role:update` / `role:delete` / `role:assign-permission` / `user:read` / `user:assign-role`，幂等插入）、**`InitUserPermissions`**（用户管理 3 个权限点：`user:create` / `user:update` / `user:disable`，幂等插入）与 **`InitSessionPermissions`**（会话管理 2 个权限点：`session:read` / `session:revoke`，幂等插入）；
 用户名/邮箱/手机号的唯一性用**局部唯一索引**（`WHERE deleted_at IS NULL`，软删行不占用标识——注销后标识可重新注册）；
 `DB_SYNCHRONIZE` 已全面关闭（`.env` / `.env.test` / 生产均 `false`），schema 变更一律走迁移。新增/修改实体后：
 
@@ -442,11 +462,11 @@ $ pnpm run start:dev
 - **Swagger 响应装饰器**：共享工厂在 `src/common/swagger/api-response.decorator.ts`（`ApiOkEnvelope` / `ApiCreatedEnvelope` / `ApiConflictResponse`），统一信封已文档化到认证端点的 Responses；401/429 属通用契约（见「通用接口约定」）不在每个端点标注。新增业务端点时复用成功装饰器 + 接口特有失败装饰器。
 - **登录标识按形态路由**：登录时账号按形态判定为邮箱（含 `@`）/手机号（纯数字或 `+` 区号开头，6-20 位）/用户名（其余）后单字段查询——避免"某标识同时是 A 的用户名与 B 的手机号"时 OR 查询命中多行、绑定不可预期。由于 6-20 位纯数字会被当作手机号，注册校验已直接拒绝这类用户名。注册端仍有跨字段冲突检查 + 唯一索引兜底。
 - **refresh token 响应体回传（双通道契约）**：HttpOnly Cookie 是浏览器通道；响应体同时回传明文 refresh token 供移动端/无 Cookie 客户端使用。代价：存在 XSS 时，脚本可调用刷新接口并从 JSON 响应读取新令牌（HttpOnly 只阻止"直接读 Cookie"）。缓解：前端代码不得读取/存储该字段、CORS 收紧（不暴露接口给第三方源）、CSP 降低注入面。若确认只服务浏览器，可在 `auth.controller.ts` 的 `setRefreshCookie` 后不返回 `refreshToken` 字段并移除 body 通道（`RefreshDto.refreshToken` 随之弃用）——属破坏性契约变更，需统一评估。
-- **refresh token 轮换并发**：同一 refresh token 被并发请求共用时，后到者必然 401（旧令牌已被轮换撤销）。前端刷新需做 single-flight（合并并发刷新请求为一次）；无宽限期的选择是刻意的——可降低令牌被盗重放的窗口。
-- **refresh_tokens 只增不清**：当前仅靠 7 天 TTL + 登出撤销，过期/已撤销行暂由 `idx_refresh_tokens_expires` 索引兜底，尚未挂 cron 清理；同一用户会话数也无上限。属后续阶段（审计/会话管理）落地项。
+- **refresh token 轮换并发**：同一 refresh token 被并发请求共用时，后到者必然 401（旧令牌已被轮换撤销，CAS 保证）。前端刷新需做 single-flight（合并并发刷新请求为一次）；无宽限期的选择是刻意的——可降低令牌被盗重放的窗口。
+- **refresh_tokens 收敛**：登录成功时惰性删除该用户已过期行（只按过期收敛，未过期的撤销行保留——盗用检测依赖）；已撤销但未过期的行仍只靠 7 天 TTL + `idx_refresh_tokens_expires` 索引兜底，未挂 cron；同一用户会话数无上限（在线列表分页查看）。
 - **密码哈希用原生 `bcrypt`（非 bcryptjs）**：bcryptjs 是纯 JS 实现，同 cost 下比原生慢数倍且全部计算占用主线程（其"异步"是分片让出式）；原生 `bcrypt` 走 libuv 线程池，主线程几乎零负担。代价是原生依赖：`pnpm` 需在 `pnpm-workspace.yaml` 的 `allowBuilds` 放行其构建脚本，Docker 镜像依赖官方 musl prebuilt。`argon2` 是更现代的 KDF（内存硬、抗 GPU/ASIC），若未来需要可迁移。
 - **开发环境默认弱密码**（`pg_dev_password` / `redis_dev_password`）：仅存在于 dev compose 与 `.env.example`，生产模板要求强密码且缺失即拒启。
-- **会话版本号（管理端踢人预留）**：`users.session_version` 已进首个迁移（默认 0）。设计：签发 access token 时把版本写入 JWT payload，`JwtAuthGuard` 每请求比对（与现有"每请求复查用户状态"同一次查库），不一致即 401——管理端"强制下线" = 版本 +1，该用户所有已签发 access token 立即失效（无状态 JWT 无法主动撤销，靠版本比对实现即时生效）。当前仅 schema 预留，不对外暴露（不在 `SafeUser`）；踢人逻辑在管理端（RBAC）阶段实现。
+- **会话版本号（踢出即时生效）**：`users.session_version`（默认 0）签进 access payload，`JwtAuthGuard` 每请求比对（与现有"每请求复查用户状态"同一次查库），不一致即 401。强制下线 = 版本 +1，该用户所有已签发 access token 立即失效（无状态 JWT 无法主动撤销，靠版本比对实现即时生效）；旧实现签发的令牌无此字段（undefined ≠ 当前版本）→ 一律重新登录，开发期无存量令牌，无兼容成本。
 - **首个发布前迁移允许就地改写**：`InitAuth` 在首个发布前被就地改写（局部唯一索引），因为确认没有任何持久环境应用过旧版；**此后 schema 变更必须追加新迁移**，且 `migration:revert` 只对当前 DDL 有效——不要修改已提交/已应用过的迁移文件。
 
 ## 相关资源
