@@ -22,6 +22,8 @@ import { User } from './user.entity';
 @Entity('refresh_tokens')
 @Index('idx_refresh_tokens_user_revoked', ['userId', 'revokedAt'])
 @Index('idx_refresh_tokens_expires', ['expiresAt'])
+// 在线列表按 (created_at DESC, id DESC) 分页（见 sessions.service）——排序路径复合索引
+@Index('idx_refresh_tokens_created_id', ['createdAt', 'id'])
 export class RefreshToken {
   /** 主键：bigserial（返回 string，见 User.id） */
   @PrimaryGeneratedColumn({ type: 'bigint' })

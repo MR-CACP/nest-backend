@@ -4,8 +4,10 @@ import {
   ForbiddenException,
   NotFoundException,
 } from '@nestjs/common';
+import { plainToInstance } from 'class-transformer';
 import { type DataSource, FindOperator } from 'typeorm';
 
+import { UpdateUserDto } from '@/modules/users/users.dto';
 import { UsersService } from '@/modules/users/users.service';
 
 // expect.any/anything 返回 any（@types/jest），直接放进断言会触发
@@ -39,6 +41,8 @@ describe('UsersService', () => {
     findOne: jest.Mock;
     createQueryBuilder: jest.Mock;
   };
+  // 操作审计 mock：顶层声明，it 回调可直接断言 record 调用
+  let audit: { record: jest.Mock };
 
   beforeEach(() => {
     users = {
@@ -77,6 +81,7 @@ describe('UsersService', () => {
       findOne: jest.fn(),
       createQueryBuilder: jest.fn(() => txQb),
     };
+    audit = { record: jest.fn() };
     const dataSource = {
       transaction: jest.fn((cb: (m: unknown) => Promise<unknown>) => {
         // manager 返回独立 txRepo（与默认仓库 mock 区分——验证事务内走 manager）
@@ -89,6 +94,7 @@ describe('UsersService', () => {
       roles as never,
       userRoles as never,
       dataSource,
+      audit as never,
     );
   });
 
@@ -162,6 +168,16 @@ describe('UsersService', () => {
       expect(txRepos.insert).toHaveBeenCalledWith([
         { userId: '7', roleId: '1' },
       ]);
+      // 操作审计：动作码 + operatorId + resourceId + detail.roleIds 透传
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'user.roles.assign',
+          operatorId: 'op',
+          resourceType: 'user',
+          resourceId: '7',
+          detail: { roleIds: ['1'] },
+        }),
+      );
     });
 
     it('提权防护：非 admin 操作者分配自己未拥有的角色（如 admin）→ 403', async () => {
@@ -249,13 +265,16 @@ describe('UsersService', () => {
         username: 'admin2',
         status: 'active',
       });
-      const result = await service.createUser({
-        username: 'admin2',
-        password: 'secret123',
-        email: '  Alice@Example.com ',
-        phone: '+86 138-0013-8000',
-        nickname: '二号',
-      });
+      const result = await service.createUser(
+        {
+          username: 'admin2',
+          password: 'secret123',
+          email: '  Alice@Example.com ',
+          phone: '+86 138-0013-8000',
+          nickname: '二号',
+        },
+        'op',
+      );
       expect(users.save).toHaveBeenCalledWith(
         expect.objectContaining({
           username: 'admin2',
@@ -266,6 +285,16 @@ describe('UsersService', () => {
         }),
       );
       expect(result.status).toBe('active');
+      // 操作审计：动作码 + operatorId + resourceId + detail.username 透传
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'user.create',
+          operatorId: 'op',
+          resourceType: 'user',
+          resourceId: '9',
+          detail: { username: 'admin2' },
+        }),
+      );
     });
 
     it('标识冲突（活跃行 409）', async () => {
@@ -275,7 +304,7 @@ describe('UsersService', () => {
         deletedAt: null,
       });
       await expect(
-        service.createUser({ username: 'taken', password: 'secret123' }),
+        service.createUser({ username: 'taken', password: 'secret123' }, 'op'),
       ).rejects.toBeInstanceOf(ConflictException);
     });
 
@@ -283,13 +312,13 @@ describe('UsersService', () => {
       users.findOne.mockResolvedValue(null);
       users.save.mockRejectedValue({ driverError: { code: '23505' } });
       await expect(
-        service.createUser({ username: 'dup', password: 'secret123' }),
+        service.createUser({ username: 'dup', password: 'secret123' }, 'op'),
       ).rejects.toBeInstanceOf(ConflictException);
     });
 
     it('超长密码（>72 字节）→ 400（与注册同规则）', async () => {
       await expect(
-        service.createUser({ username: 'u', password: '汉'.repeat(30) }),
+        service.createUser({ username: 'u', password: '汉'.repeat(30) }, 'op'),
       ).rejects.toBeInstanceOf(BadRequestException);
     });
   });
@@ -312,7 +341,10 @@ describe('UsersService', () => {
       };
       users.findOneBy.mockResolvedValue(user);
       users.save.mockImplementation((u: object) => Promise.resolve(u));
-      const result = await service.updateUser('7', { nickname: '新昵称' });
+      // plainToInstance 构造（与 ValidationPipe transform:true 一致）：DTO 所有声明
+      // 字段都会成为自有属性（值 undefined）——只有按值过滤的实现才只记实际传入字段
+      const dto = plainToInstance(UpdateUserDto, { nickname: '新昵称' });
+      const result = await service.updateUser('7', dto, 'op', '1.2.3.4');
       expect(result.nickname).toBe('新昵称');
       // 未修改字段：响应反映持久化真实值，不是被 Object.assign 改写成 undefined 的内存值
       expect(result.realName).toBe('张三');
@@ -324,12 +356,23 @@ describe('UsersService', () => {
       // P1：返回投影（非同一实体引用），passwordHash 不外泄
       expect(result).not.toBe(user);
       expect(result).not.toHaveProperty('passwordHash');
+      // 操作审计：user.update + detail.changed 由 Object.keys(dto) 生成（DTO 加字段自动纳入）
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'user.update',
+          operatorId: 'op',
+          resourceType: 'user',
+          resourceId: '7',
+          detail: { changed: ['nickname'] },
+          ip: '1.2.3.4',
+        }),
+      );
     });
 
     it('用户不存在 → 404', async () => {
       users.findOneBy.mockResolvedValue(null);
       await expect(
-        service.updateUser('99', { nickname: 'x' }),
+        service.updateUser('99', { nickname: 'x' }, 'op'),
       ).rejects.toBeInstanceOf(NotFoundException);
     });
   });
@@ -395,6 +438,16 @@ describe('UsersService', () => {
         sessionVersion: number;
       };
       expect(savedUser.sessionVersion).toBe(1);
+      // 操作审计：状态转换（from → to）+ 操作者 IP 透传（缺省 undefined → 落 NULL）
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'user.status.update',
+          operatorId: 'op',
+          resourceType: 'user',
+          resourceId: '7',
+          detail: { from: 'active', to: 'disabled' },
+        }),
+      );
     });
 
     it('恢复 active 不撤销会话、不递增版本（历史已撤销行保留审计）', async () => {

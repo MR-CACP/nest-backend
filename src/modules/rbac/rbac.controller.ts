@@ -95,8 +95,11 @@ export class RbacController {
   @Post('roles')
   @Permissions(PERMISSION_CODES.ROLE_CREATE)
   @ApiCreatedResponse({ description: '创建成功', schema: ROLE_ITEM_SCHEMA })
-  createRole(@Body() dto: CreateRoleDto): Promise<Role> {
-    return this.rbacService.createRole(dto);
+  createRole(
+    @Body() dto: CreateRoleDto,
+    @Req() req: AuthenticatedRequest,
+  ): Promise<Role> {
+    return this.rbacService.createRole(dto, req.user.id, req.ip);
   }
 
   /** 更新角色（系统角色 403；code 不可改） */
@@ -107,8 +110,9 @@ export class RbacController {
   updateRole(
     @Param('id') id: string,
     @Body() dto: UpdateRoleDto,
+    @Req() req: AuthenticatedRequest,
   ): Promise<Role> {
-    return this.rbacService.updateRole(id, dto);
+    return this.rbacService.updateRole(id, dto, req.user.id, req.ip);
   }
 
   /** 删除角色（系统角色 403；仍有关联用户 409） */
@@ -116,8 +120,11 @@ export class RbacController {
   @Permissions(PERMISSION_CODES.ROLE_DELETE)
   @ApiOkResponse({ description: '删除成功' })
   @ApiParam({ name: 'id', description: '角色 ID' })
-  deleteRole(@Param('id') id: string): Promise<void> {
-    return this.rbacService.deleteRole(id);
+  deleteRole(
+    @Param('id') id: string,
+    @Req() req: AuthenticatedRequest,
+  ): Promise<void> {
+    return this.rbacService.deleteRole(id, req.user.id, req.ip);
   }
 
   /** 给角色分配权限（整体替换；系统角色 403） */
@@ -135,6 +142,7 @@ export class RbacController {
       id,
       dto.permissionIds,
       req.user.id,
+      req.ip,
     );
   }
 

@@ -19,6 +19,7 @@ import {
   type UpdateResult,
 } from 'typeorm';
 
+import { LoginLog } from '@/modules/audit/entities/login-log.entity';
 import { AuthService } from '@/modules/auth/auth.service';
 import { RefreshToken } from '@/modules/auth/entities/refresh-token.entity';
 import { User } from '@/modules/auth/entities/user.entity';
@@ -66,6 +67,11 @@ type TokenRepo = {
 
 describe('AuthService', () => {
   let service: AuthService;
+  let loginLogsRepo: {
+    // save 带参数泛型：mock.calls 类型化为 [object][]，杜绝 calls[0] 的 any 成员访问
+    save: jest.Mock<Promise<object>, [object]>;
+    create: jest.Mock;
+  };
   let users: jest.Mocked<UserRepo>;
   let refreshTokens: jest.Mocked<TokenRepo>;
   let permissions: { find: jest.Mock };
@@ -78,28 +84,33 @@ describe('AuthService', () => {
   let userManagerRepo: { createQueryBuilder: jest.Mock };
 
   /** 构造一个合法的 User 样本（仅测试用，不触发数据库） */
-  const makeUser = (overrides: Partial<User> = {}): User => ({
-    id: '1',
-    username: 'alice',
-    email: 'alice@example.com',
-    phone: null,
-    passwordHash: 'hashed:secret123',
-    nickname: null,
-    realName: null,
-    gender: null,
-    birthDate: null,
-    avatarUrl: null,
-    emailVerifiedAt: null,
-    phoneVerifiedAt: null,
-    status: 'active',
-    sessionVersion: 0,
-    roles: [],
-    createdAt: new Date('2026-01-01T00:00:00Z'),
-    updatedAt: new Date('2026-01-01T00:00:00Z'),
-    remark: null,
-    deletedAt: null,
-    ...overrides,
-  });
+  // roles 现为实体 getter（只读）+ userRoles/rolePermissions 必填，普通字面量无法满足
+  // User 类型 → overrides 放宽为 Record 并整体断言（mock 只模拟 service 观察到的形状）
+  const makeUser = (overrides: Record<string, unknown> = {}): User =>
+    ({
+      id: '1',
+      username: 'alice',
+      email: 'alice@example.com',
+      phone: null,
+      passwordHash: 'hashed:secret123',
+      nickname: null,
+      realName: null,
+      gender: null,
+      birthDate: null,
+      avatarUrl: null,
+      emailVerifiedAt: null,
+      phoneVerifiedAt: null,
+      status: 'active',
+      sessionVersion: 0,
+      // 普通属性 roles（mock 不经 TypeORM，getter 只在真实实体上生效）：
+      // service 读 user.roles 需要运行期可见的数组
+      roles: [],
+      createdAt: new Date('2026-01-01T00:00:00Z'),
+      updatedAt: new Date('2026-01-01T00:00:00Z'),
+      remark: null,
+      deletedAt: null,
+      ...overrides,
+    }) as unknown as User;
 
   beforeEach(() => {
     users = {
@@ -114,6 +125,11 @@ describe('AuthService', () => {
       create: jest.fn(),
       update: jest.fn(),
       delete: jest.fn(), // 登录惰性清理（删除该用户已过期行）
+    };
+    // 登录日志仓库（create 透传实体，save 断言才能收到对象）
+    loginLogsRepo = {
+      save: jest.fn() as jest.Mock<Promise<object>, [object]>,
+      create: jest.fn((e: DeepPartial<LoginLog>) => e as LoginLog),
     };
     permissions = { find: jest.fn() };
     jwtService = { signAsync: jest.fn() };
@@ -164,6 +180,7 @@ describe('AuthService', () => {
       users as unknown as Repository<User>,
       refreshTokens as unknown as Repository<RefreshToken>,
       permissions as unknown as Repository<Permission>,
+      loginLogsRepo as unknown as Repository<LoginLog>,
       jwtService as unknown as JwtService,
       configService as unknown as ConfigService,
       logger as unknown as PinoLogger,
@@ -440,6 +457,76 @@ describe('AuthService', () => {
     });
   });
 
+  describe('recordLoginLog（登录日志写入契约：脱敏 + 列宽裁剪，防 22001 被吞后登录不留痕）', () => {
+    it('登录成功：save 收到脱敏后的 account + userId 关联', async () => {
+      users.findOne.mockResolvedValue(makeUser());
+      refreshTokens.save.mockResolvedValue({} as RefreshToken);
+      await service.login(
+        { account: 'victim@example.com', password: 'secret123' },
+        '1.1.1.1',
+        'test-agent',
+      );
+      const saved = loginLogsRepo.save.mock.calls[0][0] as {
+        account: string;
+        userId: string;
+        success: boolean;
+      };
+      expect(saved.account).toBe('v***@example.com'); // 脱敏后才落库
+      expect(saved.userId).toBe('1');
+      expect(saved.success).toBe(true);
+    });
+
+    it('超长 UA/ip/account：写入前按列宽裁剪（255/45/255），INSERT 不再 22001', async () => {
+      users.findOne.mockResolvedValue(makeUser());
+      refreshTokens.save.mockResolvedValue({} as RefreshToken);
+      await service.login(
+        { account: 'alice', password: 'secret123' },
+        'x'.repeat(60), // >45：ip 截断
+        'Mozilla/5.0 ' + 'A'.repeat(300), // >255：UA 截断
+      );
+      const saved = loginLogsRepo.save.mock.calls[0][0] as {
+        userAgent: string;
+        ip: string;
+        account: string;
+      };
+      expect(saved.userAgent).toHaveLength(255);
+      expect(saved.ip).toHaveLength(45);
+      expect(saved.account.length).toBeLessThanOrEqual(255);
+    });
+
+    it('密码错误：invalid_credentials + 账号存在时关联 userId（审计可追溯爆破来源账号）', async () => {
+      users.findOne.mockResolvedValue(makeUser());
+      mockedCompare.mockResolvedValue(false);
+      await service
+        .login({ account: 'alice', password: 'wrong' }, 'ip', 'ua')
+        .catch(() => undefined);
+      const saved = loginLogsRepo.save.mock.calls[0][0] as {
+        success: boolean;
+        failReason: string;
+        userId: string | null;
+      };
+      expect(saved.success).toBe(false);
+      expect(saved.failReason).toBe('invalid_credentials');
+      expect(saved.userId).toBe('1');
+    });
+
+    it('写入失败：只记 warn，登录主流程不受影响（尽力而为）', async () => {
+      users.findOne.mockResolvedValue(makeUser());
+      refreshTokens.save.mockResolvedValue({} as RefreshToken);
+      loginLogsRepo.save.mockRejectedValue(new Error('db down'));
+      const result = await service.login(
+        { account: 'alice', password: 'secret123' },
+        '1.1.1.1',
+        'test-agent',
+      );
+      expect(result.accessToken).toBe('signed-access-token');
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ event: 'auth.loginLogFailed' }),
+        expect.any(String),
+      );
+    });
+  });
+
   describe('refresh（轮换）', () => {
     const activeToken = () =>
       ({
@@ -646,7 +733,6 @@ describe('AuthService', () => {
               createdAt: new Date(),
               updatedAt: new Date(),
               deletedAt: null,
-              users: [],
               description: null,
             },
           ],
@@ -675,7 +761,6 @@ describe('AuthService', () => {
                   group: null,
                   description: null,
                   createdAt: new Date(),
-                  roles: [],
                 },
                 {
                   id: '2',
@@ -684,13 +769,11 @@ describe('AuthService', () => {
                   group: null,
                   description: null,
                   createdAt: new Date(),
-                  roles: [],
                 },
               ],
               createdAt: new Date(),
               updatedAt: new Date(),
               deletedAt: null,
-              users: [],
               description: null,
             },
           ],
@@ -714,7 +797,6 @@ describe('AuthService', () => {
               createdAt: new Date(),
               updatedAt: new Date(),
               deletedAt: null,
-              users: [],
               description: null,
             },
           ],

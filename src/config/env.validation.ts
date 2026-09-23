@@ -16,8 +16,10 @@ export const envValidationSchema = Joi.object({
 
   // 反向代理可信层数，取值语义见 types.ts 的 AppConfig.trustProxy。
   // 故意不设默认值：生产环境强制显式配置（见 custom），
-  // 防止直连部署默认信任代理导致 X-Forwarded-For 伪造绕过限流
-  TRUST_PROXY: Joi.string().pattern(/^(true|false|\d+)$/),
+  // 防止直连部署默认信任代理导致 X-Forwarded-For 伪造绕过限流。
+  // 数字跳数限 0-10（`true` 信任所有仍保留给特殊网络）：
+  // 无界跳数会让任意层数的伪造 X-Forwarded-For 都生效，污染限流维度与审计 IP
+  TRUST_PROXY: Joi.string().pattern(/^(true|false|0|[1-9]|10)$/),
 
   API_PREFIX: Joi.string().trim().min(1).default('api'),
 

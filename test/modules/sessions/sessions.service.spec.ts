@@ -19,6 +19,7 @@ type QbMock = {
   andWhere: jest.Mock;
   select: jest.Mock;
   orderBy: jest.Mock;
+  addOrderBy: jest.Mock;
   skip: jest.Mock;
   take: jest.Mock;
   getManyAndCount: jest.Mock;
@@ -31,6 +32,7 @@ const makeQueryBuilder = (): QbMock => {
     andWhere: jest.fn(() => qb),
     select: jest.fn(() => qb),
     orderBy: jest.fn(() => qb),
+    addOrderBy: jest.fn(() => qb),
     skip: jest.fn(() => qb),
     take: jest.fn(() => qb),
     getManyAndCount: jest.fn(),
@@ -54,6 +56,9 @@ describe('SessionsService', () => {
   let txRepos: { findOne: jest.Mock; update: jest.Mock };
   let dataSource: { transaction: jest.Mock };
 
+  // 操作审计 mock：顶层声明，it 回调可直接断言 record 调用
+  let audit: { record: jest.Mock };
+
   beforeEach(() => {
     refreshTokens = {
       createQueryBuilder: jest.fn(),
@@ -62,6 +67,7 @@ describe('SessionsService', () => {
     };
     users = { findOne: jest.fn() };
     txRepos = { findOne: jest.fn(), update: jest.fn() };
+    audit = { record: jest.fn() };
     dataSource = {
       transaction: jest.fn(async (fn: (m: unknown) => Promise<unknown>) =>
         fn({ getRepository: () => txRepos }),
@@ -71,6 +77,7 @@ describe('SessionsService', () => {
       refreshTokens as unknown as Repository<RefreshToken>,
       users as unknown as Repository<User>,
       dataSource as unknown as DataSource,
+      audit as never,
     );
   });
 
@@ -123,6 +130,8 @@ describe('SessionsService', () => {
         ]),
       );
       expect(qb.orderBy).toHaveBeenCalledWith('rt.created_at', 'DESC');
+      // (created_at, id) 双键：同时间戳行 offset 翻页稳定（id 作决胜键）
+      expect(qb.addOrderBy).toHaveBeenCalledWith('rt.id', 'DESC');
       expect(qb.skip).toHaveBeenCalledWith(0);
       expect(qb.take).toHaveBeenCalledWith(10);
     });
@@ -178,6 +187,16 @@ describe('SessionsService', () => {
       expect(refreshTokens.update).toHaveBeenCalledWith(
         { id: 's1', revokedAt: MATCHER_ANY },
         MATCHER_ANY,
+      );
+      // 操作审计：resourceType=session + resourceId=会话 ID + detail.userId
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'session.revoke',
+          operatorId: 'op1',
+          resourceType: 'session',
+          resourceId: 's1',
+          detail: { userId: 'u1' },
+        }),
       );
     });
 
@@ -235,6 +254,15 @@ describe('SessionsService', () => {
       );
       // 锁用户行：并发踢人/删除下版本号基于锁内读到的值
       expect(txRepos.findOne).toHaveBeenCalledWith(MATCHER_LOCK_OPTIONS);
+      // 操作审计：resourceType=user（resourceId 是用户 ID 而非会话 ID）+ operatorId 透传
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'session.revoke_all',
+          operatorId: 'op1',
+          resourceType: 'user',
+          resourceId: 'u1',
+        }),
+      );
     });
 
     it('用户不存在 → 404，事务内不执行任何写', async () => {

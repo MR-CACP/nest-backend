@@ -154,11 +154,13 @@ describe('RBAC 管理端 (e2e)', () => {
       .get('/api/roles')
       .set('Authorization', `Bearer ${adminToken}`)
       .expect(200);
+    // 用本次创建的随机 code 查找（旧实现 find 'editor' 依赖历史库残留角色，
+    // dev/test 库 drop 重来后不成立——用例必须自包含、幂等）
     const editorAfter = (
       afterAssign.body as Envelope<
         { id: string; code: string; permissions: string[] }[]
       >
-    ).data.find((r) => r.code === 'editor')!;
+    ).data.find((r) => r.code === editorRole.code)!;
     expect(editorAfter.permissions).toEqual(
       expect.arrayContaining(['role:read', 'user:read']),
     );

@@ -94,7 +94,7 @@ src/
 ├── redis/                   # redis.service（缓存门面）/ redis.module（客户端构建，超时选项纯函数）
 └── health/                  # health.controller（live/ready/check）+ health.module
 
-test/                        # 测试目录，结构与 src/ 对应（25 单测 suite + 7 e2e suite）
+test/                        # 测试目录，结构与 src/ 对应（28 单测 suite + 8 e2e suite）
 ```
 
 ## 快速开始
@@ -190,13 +190,13 @@ $ pnpm run format             # Prettier 格式化
 单元测试与 e2e 测试均位于 `test/` 目录，目录结构与 `src/` 对应。
 
 ```bash
-# 单元测试（25 suites · 276 tests）
+# 单元测试（28 suites · 309 tests）
 $ pnpm run test
 
-# e2e 测试（7 suites · 34 tests）——需要先 docker compose up -d 起依赖，
+# e2e 测试（8 suites · 38 tests）——需要先 docker compose up -d 起依赖，
 # 并对测试库执行迁移：pnpm run migration:run:test
 # 注意：test:e2e 固定 --runInBand 串行执行（suite 间共享同一测试库，
-# 并行时 7 个 app 实例并发写库会偶发瞬时超时/连接竞争导致 flaky 失败，串行消除）
+# 并行时 8 个 app 实例并发写库会偶发瞬时超时/连接竞争导致 flaky 失败，串行消除）
 $ pnpm run test:e2e
 
 # 测试覆盖率（阈值：语句 65% / 分支 78% / 函数 60% / 行 65%，见 package.json）
@@ -245,7 +245,7 @@ CI（`.github/workflows/ci.yml`，Node 24 + pnpm 12.4.2 + `--frozen-lockfile`）
 - **防枚举**：登录失败统一"账号或密码错误"（响应层再统一为"未登录或登录已失效"的 401 文案）；注册冲突不区分具体字段；用户不存在/无密码账号也执行假密码比对，避免响应时长泄露账号是否存在；登录超长口令（>72 字节，bcrypt 截断上限）同样统一 401 而非顶部抛 400——快速 400 会泄露处理路径差异。
 - **即时封禁**：`JwtAuthGuard` 每个受保护请求查库复查用户状态（与 refresh 链路同语义）——账号被禁用/软删后，已签发的 access 令牌立即失效，无需等待 15 分钟 TTL 自然过期。
 - **限速**：注册/登录 5 次/分、刷新 10 次/分（`@Throttle` 装饰器，计数存储随 `THROTTLE_STORAGE` 切换）。
-- **日志**：登录成功/失败/注册写结构化 pino 日志（`event: auth.login.success/failed/register`，含 userId/IP/UA）；审计落库在后续阶段（login_logs 与 audit_logs 同生共管）。
+- **日志**：登录成功/失败/注册写结构化 pino 日志（`event: auth.login.success/failed/register`，含 userId/IP/UA）；登录三态（成功/凭据错/账号禁用）同时落 `login_logs`（账号脱敏、尽力而为写入，见下文"审计"小节）。
 
 ## RBAC 权限体系
 
@@ -310,6 +310,19 @@ adminOnly() { return { ok: true }; }
 - **降级防护（与 users 管理同口径）**：非 admin 操作者**不得下线持有 admin 角色的账号**（403，见 `common/utils/admin-guard.ts` 单一真源）——防止持 `session:revoke` 的人反复踢管理员的骚扰级 DoS；admin 旁路不受限；
 - 列表项为显式投影字段，`tokenHash` 绝不外泄。
 
+审计（AuditModule，权限点 `audit:read`；只读查询接口）：
+
+| 方法 | 路径 | 权限点 | 说明 |
+|---|---|---|---|
+| GET | `/api/audit/login-logs` | `audit:read` | 登录日志分页（`page`/`pageSize`/`success` 筛选，按时间倒序） |
+| GET | `/api/audit/logs` | `audit:read` | 管理操作审计分页（`page`/`pageSize`/`action`/`operatorId`/`resourceType` 筛选，按时间倒序） |
+
+设计要点：
+- **登录日志（login_logs）**：每次登录三态（成功 / 凭据错 / 账号禁用）落一行——`account` 一律经 `maskAccount` 脱敏（邮箱 `a***@dom`、手机号只留首尾、用户名原样），**不落 PII 明文**；写入前按列宽裁剪（`account`/`user_agent` 255、`ip` 45）——超长 UA 若任其触发 `22001` 会被“尽力而为”吞掉，导致该次登录完全不留痕（审计被绕过）；`user_id` SET NULL 外键（用户删除后日志保留审计价值）；`fail_reason` 记 `invalid_credentials` / `account_disabled`；
+- **操作审计（audit_logs）**：覆盖管理写路径（users 创建/改资料/改状态/分配角色、rbac 角色 CRUD/分配权限、sessions 单/全部下线），动作码点分命名（`user.create` / `role.update` / `session.revoke_all`）且集中定义于 `src/common/constants/audit.constants.ts`（`AUDIT_ACTIONS`，代码侧唯一真源，与权限码 `PERMISSION_CODES` 同惯例）；`resource_type` 只取 `user` / `role` / `session`——注意 `session.revoke_all` 记 `user`（`resource_id` 是被踢的用户 ID 而非会话 ID）；`detail` 只存变更摘要（状态 from→to、roleIds、code 等），**禁止敏感字段**；`operator_id` SET NULL 外键；`ip` 由 controller 透传 `req.ip` 落库（特权操作可溯源来源 IP）；
+- **尽力而为写入**：写入失败只记 warn、**绝不抛出**——登录已返回/管理操作已生效，审计是旁路，失败不得让主流程 500/回滚（与登录惰性清理同口径）；写入方在调用模块（auth 自持 LoginLog 仓库、经本模块 `recordLoginLog` 写入；users/rbac/sessions 经 AuditService），AuditModule 只读查询，避免 AuthModule↔AuditModule 循环依赖；登录日志不再经 AuditService（曾与 auth 各持一份重复实现、且测试覆盖的是不被调用的那份死代码，已删除）；
+- **查询层无需二次脱敏**：库中已是脱敏值；分页 pageSize 上限 100、page 上限 1_000_000（防 `(page-1)*pageSize` 溢出 bigint 触发 PG `22003` → 500）。
+
 要点：
 - **模块归属**：`/api/users*` 归 UsersModule（用户资源上的管理操作：列表/创建/资料/状态/角色分配），
   RbacModule 只管 `/roles`、`/permissions` 与角色-权限绑定；权限点常量仍在 `rbac.constants.ts`（代码侧唯一真源）；
@@ -370,7 +383,7 @@ docker/.env.prod      只给"生产 compose 插值"用，应用不读它；
 
 ### Migration 工作流
 
-仓库已有五个迁移（见 `src/database/migrations/`）：**`InitAuth`**（`users` + `refresh_tokens` 表）、**`InitRbac`**（`roles` / `permissions` / `user_roles` / `role_permissions` 四表 + 种子角色 `admin` / `user`，幂等插入）、**`InitRbacPermissions`**（管理端 7 个权限点种子：`role:read` / `role:create` / `role:update` / `role:delete` / `role:assign-permission` / `user:read` / `user:assign-role`，幂等插入）、**`InitUserPermissions`**（用户管理 3 个权限点：`user:create` / `user:update` / `user:disable`，幂等插入）与 **`InitSessionPermissions`**（会话管理 2 个权限点：`session:read` / `session:revoke`，幂等插入）；
+仓库已有八个迁移（见 `src/database/migrations/`）：**`InitAuth`**（`users` + `refresh_tokens` 表）、**`InitRbac`**（`roles` / `permissions` / `user_roles` / `role_permissions` 四表 + 种子角色 `admin` / `user`，幂等插入）、**`InitRbacPermissions`**（管理端 7 个权限点种子：`role:read` / `role:create` / `role:update` / `role:delete` / `role:assign-permission` / `user:read` / `user:assign-role`，幂等插入）、**`InitUserPermissions`**（用户管理 3 个权限点：`user:create` / `user:update` / `user:disable`，幂等插入）与 **`InitSessionPermissions`**（会话管理 2 个权限点：`session:read` / `session:revoke`，幂等插入）、**`InitAudit`**（`login_logs` + `audit_logs` 两表及索引，`user_id` / `operator_id` 均 SET NULL 外键——用户删除后审计保留）、**`InitAuditPermissions`**（审计 1 个权限点：`audit:read`，幂等插入）与 **`InitPaginationIndexes`**（用户/在线会话列表的 `(created_at, id)` 稳定分页排序索引，幂等创建）。权限点合计 **13** 个；
 用户名/邮箱/手机号的唯一性用**局部唯一索引**（`WHERE deleted_at IS NULL`，软删行不占用标识——注销后标识可重新注册）；
 `DB_SYNCHRONIZE` 已全面关闭（`.env` / `.env.test` / 生产均 `false`），schema 变更一律走迁移。新增/修改实体后：
 

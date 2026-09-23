@@ -2,7 +2,9 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, IsNull, Repository } from 'typeorm';
 
+import { AUDIT_ACTIONS } from '../../common/constants/audit.constants';
 import { assertNoAdminDowngrade } from '../../common/utils/admin-guard';
+import { AuditService } from '../audit/audit.service';
 import { RefreshToken } from '../auth/entities/refresh-token.entity';
 import { User } from '../auth/entities/user.entity';
 import type { ListSessionsQuery } from './sessions.dto';
@@ -49,6 +51,7 @@ export class SessionsService {
     private readonly users: Repository<User>,
     // 全部下线：撤销会话 + 递增版本号必须同事务（同生共死）
     private readonly dataSource: DataSource,
+    private readonly audit: AuditService,
   ) {}
 
   /**
@@ -81,7 +84,9 @@ export class SessionsService {
         'rt.expiresAt',
         'rt.revokedAt',
       ])
+      // (created_at, id) 双键排序：offset 翻页稳定（与 users 列表同款理由）
       .orderBy('rt.created_at', 'DESC')
+      .addOrderBy('rt.id', 'DESC')
       .skip((page - 1) * pageSize)
       .take(pageSize)
       .getManyAndCount();
@@ -116,7 +121,12 @@ export class SessionsService {
    *                  同一骚扰级 DoS）。先查会话所属用户 roles 再判定，随后 CAS 撤销
    *                  （并发撤销后到者 affected=0 → 404）
    */
-  async revokeOne(id: string, operatorId: string): Promise<void> {
+  async revokeOne(
+    id: string,
+    operatorId: string,
+    /** 操作者 IP（controller 透传 req.ip，落 audit_logs） */
+    ip?: string,
+  ): Promise<void> {
     const session = await this.refreshTokens.findOneBy({
       id,
       revokedAt: IsNull(),
@@ -131,11 +141,11 @@ export class SessionsService {
     const [target, operator] = await Promise.all([
       this.users.findOne({
         where: { id: session.userId },
-        relations: { roles: true },
+        relations: { userRoles: { role: true } },
       }),
       this.users.findOne({
         where: { id: operatorId },
-        relations: { roles: true },
+        relations: { userRoles: { role: true } },
       }),
     ]);
     // target 为 null（孤儿会话/用户已删）：无用户可降级，放行撤销（清理异常数据）
@@ -147,6 +157,15 @@ export class SessionsService {
     if (revoked.affected !== 1) {
       throw new NotFoundException('会话不存在或已下线');
     }
+    // 操作审计（尽力而为）
+    await this.audit.record({
+      operatorId,
+      action: AUDIT_ACTIONS.SESSION_REVOKE,
+      resourceType: 'session',
+      resourceId: id,
+      detail: { userId: session.userId },
+      ip,
+    });
   }
 
   /**
@@ -160,21 +179,26 @@ export class SessionsService {
    *                  同一口径，见 common/utils/admin-guard.ts）——非 admin 操作者
    *                  不得下线持有 admin 角色的账号（防止反复踢管理员的骚扰级 DoS）
    */
-  async revokeAllByUser(userId: string, operatorId: string): Promise<void> {
+  async revokeAllByUser(
+    userId: string,
+    operatorId: string,
+    /** 操作者 IP（controller 透传 req.ip，落 audit_logs） */
+    ip?: string,
+  ): Promise<void> {
     // 降级判定用查库后的实时角色（与"每请求查库"模型一致，不复用令牌快照）；
     // 操作者同样独立查库，不复用 JwtAuthGuard 预加载的 req.userEntity——
     // 与 users 模块同口径的防御设计（防上下文篡改/身份漂移；管理端低频可接受）。
     // 目标含 roles：判定目标是否持 admin
     const target = await this.users.findOne({
       where: { id: userId },
-      relations: { roles: true },
+      relations: { userRoles: { role: true } },
     });
     if (!target) {
       throw new NotFoundException('用户不存在');
     }
     const operator = await this.users.findOne({
       where: { id: operatorId },
-      relations: { roles: true },
+      relations: { userRoles: { role: true } },
     });
     assertNoAdminDowngrade(target.roles, operator, '无权下线管理员账号的会话');
     await this.dataSource.transaction(async (manager) => {
@@ -199,5 +223,15 @@ export class SessionsService {
     // · 本事务先提交 → refresh 后锁行，其 CAS 撤销匹配不到已撤销的旧行 → 401；
     // · refresh 先提交 → 本事务的批量撤销会覆盖新插入的行 → 会话被彻底清除。
     // 无"批量撤销后新 refresh 行复活会话"的竞态窗口。
+    // 操作审计（尽力而为）
+    // 注意 resourceType 用 'user' 而非 'session'：resourceId 是**用户 ID**（不是会话 ID），
+    // 用 'session' 会让"按 resourceType=session 检索"混入两种语义（会话 ID / 用户 ID）
+    await this.audit.record({
+      operatorId,
+      action: AUDIT_ACTIONS.SESSION_REVOKE_ALL,
+      resourceType: 'user',
+      resourceId: userId,
+      ip,
+    });
   }
 }

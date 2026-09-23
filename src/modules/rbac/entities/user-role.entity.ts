@@ -1,6 +1,7 @@
 import {
   CreateDateColumn,
   Entity,
+  Index,
   JoinColumn,
   ManyToOne,
   PrimaryColumn,
@@ -19,6 +20,10 @@ import { Role } from './role.entity';
  * - FK 均 ON DELETE CASCADE：删除用户/角色时关联自动清理。
  */
 @Entity('user_roles')
+// FK 列索引：TypeORM 不会为显式 @OneToMany 连接表自动建索引，手写迁移与实体
+// 同步声明（对齐审计模块做法），避免连接表按外键查询走全表扫描
+@Index('idx_user_roles_user', ['userId'])
+@Index('idx_user_roles_role', ['roleId'])
 export class UserRole {
   /** 用户 ID（联合主键之一，FK → users.id） */
   @PrimaryColumn({ name: 'user_id', type: 'bigint' })
@@ -34,11 +39,19 @@ export class UserRole {
 
   /** 关联用户（管理端"按用户查角色"用） */
   @ManyToOne(() => User, { onDelete: 'CASCADE' })
-  @JoinColumn({ name: 'user_id' })
+  // foreignKeyConstraintName 对齐 InitRbac 迁移的手写约束名：不声明则 TypeORM 用 hash 名，
+  // schema:log/generate 会计划 DROP 手写约束重建（同审计模块的处理，避免危险迁移）
+  @JoinColumn({
+    name: 'user_id',
+    foreignKeyConstraintName: 'FK_user_roles_user',
+  })
   user?: User;
 
   /** 关联角色（管理端"按角色查用户"用） */
   @ManyToOne(() => Role, { onDelete: 'CASCADE' })
-  @JoinColumn({ name: 'role_id' })
+  @JoinColumn({
+    name: 'role_id',
+    foreignKeyConstraintName: 'FK_user_roles_role',
+  })
   role?: Role;
 }

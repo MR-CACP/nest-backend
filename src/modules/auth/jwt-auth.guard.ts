@@ -87,7 +87,9 @@ export class JwtAuthGuard implements CanActivate {
     const user = needsRbac
       ? await this.users.findOne({
           where: { id: payload.sub },
-          relations: { roles: { permissions: true } },
+          relations: {
+            userRoles: { role: { rolePermissions: { permission: true } } },
+          },
         })
       : await this.users.findOneBy({ id: payload.sub });
     if (!user || user.status !== 'active') {

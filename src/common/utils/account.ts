@@ -11,6 +11,41 @@ import { hash } from 'bcrypt';
 /** bcrypt 成本：注册/管理端创建统一用 10（约 50-100ms，抗 GPU 爆破） */
 export const BCRYPT_COST = 10;
 
+/**
+ * 列宽裁剪（审计/日志落库前统一使用）："列宽由写入方保证"的唯一实现。
+ * null/undefined → null（不落占位空串）；超长截断到 max。
+ * auth 登录日志与 audit 管理审计共用，避免同一切割逻辑两种写法漂移。
+ */
+export function truncate(
+  value: string | null | undefined,
+  max: number,
+): string | null {
+  return value ? value.slice(0, max) : null;
+}
+
+/**
+ * 账号脱敏（日志/审计用，不落 PII 明文）：
+ * - 邮箱：首字符 + *** + @domain（al***@example.com）；
+ * - 手机号：先规范化（去分隔符）再脱敏，避免原始串带 +86/空格/连字符时
+ *   正则匹配失败、把明文写进日志；规范化后按 `+?数字` 识别；
+ * - 其余形态（用户名等）：原样返回（用户名本身不是敏感 PII，且保留可追踪）。
+ */
+export function maskAccount(account: string): string {
+  // 用 indexOf 而非 split：多 @ 输入（如 a@b@c）split 会丢尾部，审计不可丢数据；
+  // indexOf 取首个 @ 后整体保留 @ 及之后部分（登录账号已过校验，多 @ 属异常输入）
+  const at = account.indexOf('@');
+  if (at > 0) {
+    return `${account.charAt(0)}***${account.slice(at)}`;
+  }
+  const normalized = normalizePhone(account);
+  if (normalized && /^\+?\d{6,20}$/.test(normalized)) {
+    return normalized.length > 7
+      ? `${normalized.slice(0, 3)}****${normalized.slice(-4)}`
+      : '***';
+  }
+  return account;
+}
+
 /** 邮箱规范化：小写（PG varchar 大小写敏感，避免同邮箱双账号） */
 export function normalizeEmail(email: string | undefined): string | null {
   return email ? email.trim().toLowerCase() : null;

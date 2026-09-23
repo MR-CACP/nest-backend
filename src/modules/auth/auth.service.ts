@@ -25,10 +25,13 @@ import {
   assertPasswordByteLength,
   hashPassword,
   isUniqueViolation,
+  maskAccount,
   normalizeEmail,
   normalizePhone,
+  truncate,
 } from '../../common/utils/account';
 import type { JwtConfig } from '../../config/types';
+import { LoginLog } from '../audit/entities/login-log.entity';
 import { Permission } from '../rbac/entities/permission.entity';
 import type { LoginDto } from './dto/login.dto';
 import type { RegisterDto } from './dto/register.dto';
@@ -106,6 +109,10 @@ export class AuthService {
     // RBAC：/me 的 admin 全量权限码查询（表小，见 toSafeUserWithRbac）
     @InjectRepository(Permission)
     private readonly permissions: Repository<Permission>,
+    // 登录日志：实体注册在 AuditModule 的 forFeature（实体全局注册），
+    // 这里就近持有仓库写入——避免 AuthModule → AuditModule 循环依赖
+    @InjectRepository(LoginLog)
+    private readonly loginLogs: Repository<LoginLog>,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
     private readonly logger: PinoLogger,
@@ -171,12 +178,22 @@ export class AuthService {
       this.logger.warn(
         {
           event: 'auth.login.failed',
-          account: this.maskAccount(dto.account),
+          account: maskAccount(dto.account),
           ip,
           userAgent,
         },
         '登录失败：账号或密码错误',
       );
+      // 登录日志（尽力而为：写失败不影响 401 语义）
+      // userId：账号存在（密码错/无密码哈希）时关联用户；账号不存在时为 null
+      await this.recordLoginLog({
+        userId: user?.id,
+        account: dto.account,
+        success: false,
+        failReason: 'invalid_credentials',
+        ip,
+        userAgent,
+      });
       throw new UnauthorizedException('账号或密码错误');
     }
     if (user.status !== 'active') {
@@ -189,7 +206,17 @@ export class AuthService {
         },
         '登录被拒绝：账号未激活',
       );
-      // 业务结果而非框架故障：走业务码契约，前端可区分"凭据错误(401)"与"账号被禁(bizCode)"
+      // 登录日志（尽力而为）
+      await this.recordLoginLog({
+        userId: user.id,
+        account: dto.account,
+        success: false,
+        failReason: 'account_disabled',
+        ip,
+        userAgent,
+      });
+      // 业务结果而非框架故障：走业务码契约（HTTP 200 + bizCode），
+      // 前端可区分"凭据错误(401)"与"账号被禁(bizCode)"
       throw new BusinessException('账号已被禁用', ACCOUNT_DISABLED_BIZ_CODE);
     }
 
@@ -200,6 +227,14 @@ export class AuthService {
       userAgent,
       user.sessionVersion,
     );
+    // 登录日志（尽力而为：写失败不影响已签发的令牌对）
+    await this.recordLoginLog({
+      userId: user.id,
+      account: dto.account,
+      success: true,
+      ip,
+      userAgent,
+    });
     // 惰性清理：登录成功后删除该用户全部已过期行——revoked_at IS NULL 且已过期的行
     // 不再算在线（在线判定已排除）；已撤销但未过期的行保留（"已轮换令牌再次出现"的
     // 盗用检测依赖撤销记录）。只按过期收敛，不删未过期的撤销行，自然遏制 refresh_tokens
@@ -329,7 +364,9 @@ export class AuthService {
     const user = await this.users.findOne({
       where: { id: userId },
       // 角色 + 角色权限一起加载，组装 /me 的 roles/permissions
-      relations: { roles: { permissions: true } },
+      relations: {
+        userRoles: { role: { rolePermissions: { permission: true } } },
+      },
     });
     if (!user) {
       throw new UnauthorizedException('用户不存在');
@@ -419,6 +456,43 @@ export class AuthService {
   }
 
   /**
+   * 记录登录日志（尽力而为）：登录成功/失败已返回客户端，日志写失败只记 warn，
+   * 绝不抛出——否则"令牌已签发、日志 INSERT 失败"会让客户端收到 500 并重试登录
+   * （与登录惰性清理同口径）。
+   * 关键：**写入前按列宽裁剪**——UA/account 截断 255、ip 截断 45。若不裁剪，
+   * 客户端发一个 >255 字符的 UA 会让 INSERT 抛 22001（value too long），被
+   * 尽力而为吞掉后该次登录**完全不留痕**——对以追溯爆破为目的的登录审计是
+   * 功能被绕过（login-log 实体注释里的"截断 255"必须由这里变成真代码）。
+   * account 在本方法内脱敏（maskAccount）后入库，不落 PII 明文。
+   */
+  private async recordLoginLog(input: {
+    userId?: string;
+    account: string;
+    success: boolean;
+    failReason?: 'invalid_credentials' | 'account_disabled';
+    ip?: string;
+    userAgent?: string;
+  }): Promise<void> {
+    try {
+      await this.loginLogs.save(
+        this.loginLogs.create({
+          userId: input.userId ?? null,
+          account: truncate(maskAccount(input.account), 255),
+          success: input.success,
+          failReason: input.failReason ?? null,
+          ip: truncate(input.ip, 45),
+          userAgent: truncate(input.userAgent, 255),
+        }),
+      );
+    } catch (error) {
+      this.logger.warn(
+        { event: 'auth.loginLogFailed', error },
+        '登录日志写入失败（已忽略，不影响登录主流程）',
+      );
+    }
+  }
+
+  /**
    * 签发访问令牌 + 刷新令牌（刷新令牌落库，返回明文）。
    * access token 载荷 = { sub, sessionVersion }：
    * 强制下线（SessionsService.revokeAllByUser）递增 session_version 后，
@@ -449,8 +523,8 @@ export class AuthService {
         // ip 列 varchar(45)：超长（异常代理链）会让 PG 报 22001 → 500，写库前截断。
         // 参数已保证非空 string（controller 层 ?? ''）；'' 转 null（两列本就 nullable，
         // 空串占位既无信息量也会让"是否有 UA/IP"的查询语义失真）
-        ip: ip.slice(0, 45) || null,
-        userAgent: userAgent.slice(0, 255) || null,
+        ip: truncate(ip, 45),
+        userAgent: truncate(userAgent, 255),
       }),
     );
     return { accessToken, refreshToken };
@@ -472,27 +546,6 @@ export class AuthService {
   /** SHA-256 十六进制（64 字符，与 token_hash 列长度一致） */
   private hashToken(rawToken: string): string {
     return createHash('sha256').update(rawToken).digest('hex');
-  }
-
-  /**
-   * 登录标识日志脱敏：邮箱/手机号是 PII，不落明文日志
-   * （与异常过滤器"query 不入日志"同一立场，见 all-exceptions.filter.ts）。
-   * 用户名本身非敏感，原样保留便于排障。
-   */
-  private maskAccount(account: string): string {
-    if (account.includes('@')) {
-      const [name, domain] = account.split('@');
-      return `${name.charAt(0)}***@${domain}`;
-    }
-    // 先规范化再去分隔符判定：原始输入可能含空格/连字符（如 '+86 138-0013-8000'），
-    // 直接对原始串匹配会失败、把 PII 明文写进日志
-    const normalized = normalizePhone(account);
-    if (normalized && /^\+?\d{6,20}$/.test(normalized)) {
-      return normalized.length > 7
-        ? `${normalized.slice(0, 3)}****${normalized.slice(-4)}`
-        : '***';
-    }
-    return account;
   }
 
   /**

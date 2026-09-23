@@ -108,7 +108,7 @@ export class SessionsController {
     @Req() req: AuthenticatedRequest,
   ): Promise<void> {
     // operatorId 用于降级防护：非 admin 不得下线管理员账号（与全部下线同口径）
-    return this.sessionsService.revokeOne(id, req.user.id);
+    return this.sessionsService.revokeOne(id, req.user.id, req.ip);
   }
 
   /** 强制下线某用户全部会话（撤销全部 + 递增版本号 → 旧 access 即时失效） */
@@ -121,6 +121,6 @@ export class SessionsController {
     @Req() req: AuthenticatedRequest,
   ): Promise<void> {
     // operatorId 用于降级防护：非 admin 不得下线管理员账号（与 users 管理口径一致）
-    return this.sessionsService.revokeAllByUser(id, req.user.id);
+    return this.sessionsService.revokeAllByUser(id, req.user.id, req.ip);
   }
 }

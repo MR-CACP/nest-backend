@@ -36,32 +36,43 @@ describe('RbacController', () => {
   it('createRole：透传 DTO', async () => {
     const dto = { code: 'editor', name: '编辑' };
     service.createRole.mockResolvedValue({ id: '1' });
-    await controller.createRole(dto);
-    expect(service.createRole).toHaveBeenCalledWith(dto);
+    await controller.createRole(dto, {
+      user: { id: 'op' },
+      ip: '1.2.3.4',
+    } as never);
+    expect(service.createRole).toHaveBeenCalledWith(dto, 'op', '1.2.3.4');
   });
 
   it('updateRole：透传 id + DTO', async () => {
     const dto = { name: '新名' };
     service.updateRole.mockResolvedValue({ id: '2' });
-    await controller.updateRole('2', dto);
-    expect(service.updateRole).toHaveBeenCalledWith('2', dto);
+    await controller.updateRole('2', dto, {
+      user: { id: 'op' },
+      ip: '1.2.3.4',
+    } as never);
+    expect(service.updateRole).toHaveBeenCalledWith('2', dto, 'op', '1.2.3.4');
   });
 
   it('deleteRole：透传 id', async () => {
     service.deleteRole.mockResolvedValue(undefined);
-    await controller.deleteRole('2');
-    expect(service.deleteRole).toHaveBeenCalledWith('2');
+    await controller.deleteRole('2', {
+      user: { id: 'op' },
+      ip: '1.2.3.4',
+    } as never);
+    expect(service.deleteRole).toHaveBeenCalledWith('2', 'op', '1.2.3.4');
   });
 
   it('assignRolePermissions：拆出 permissionIds + 操作者 ID 传给 service', async () => {
     service.assignRolePermissions.mockResolvedValue(undefined);
     await controller.assignRolePermissions('2', { permissionIds: ['p1'] }, {
       user: { id: 'op' },
+      ip: '1.2.3.4',
     } as never);
     expect(service.assignRolePermissions).toHaveBeenCalledWith(
       '2',
       ['p1'],
       'op',
+      '1.2.3.4',
     );
   });
 

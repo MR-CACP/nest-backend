@@ -8,8 +8,10 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, In, Repository } from 'typeorm';
 
+import { AUDIT_ACTIONS } from '../../common/constants/audit.constants';
 import { ADMIN_ROLE_CODE } from '../../common/constants/rbac.constants';
 import { isUniqueViolation } from '../../common/utils/account';
+import { AuditService } from '../audit/audit.service';
 import { User } from '../auth/entities/user.entity';
 import { CreateRoleDto, UpdateRoleDto } from './dto/rbac.dto';
 import { Permission } from './entities/permission.entity';
@@ -59,12 +61,13 @@ export class RbacService {
     // 提权防护用：查操作者的角色/权限集合（RolesGuard 也注入 User，本模块已注册）
     @InjectRepository(User) private readonly users: Repository<User>,
     private readonly dataSource: DataSource,
+    private readonly audit: AuditService,
   ) {}
 
   /** 角色列表（含权限码；软删行过滤） */
   async listRoles(): Promise<RoleListItem[]> {
     const roles = await this.roles.find({
-      relations: { permissions: true },
+      relations: { rolePermissions: { permission: true } },
       order: { createdAt: 'ASC' },
     });
     return roles.map((role) => ({
@@ -80,17 +83,32 @@ export class RbacService {
   }
 
   /** 创建角色：code 唯一（预检 + 23505 兜底并发），isSystem 恒为 false */
-  async createRole(dto: CreateRoleDto): Promise<Role> {
+  async createRole(
+    dto: CreateRoleDto,
+    operatorId: string,
+    /** 操作者 IP（controller 透传 req.ip，落 audit_logs） */
+    ip?: string,
+  ): Promise<Role> {
     const exists = await this.roles.findOne({ where: { code: dto.code } });
     if (exists) {
       throw new ConflictException('角色 code 已存在');
     }
     try {
-      return await this.roles.save({
+      const saved = await this.roles.save({
         code: dto.code,
         name: dto.name,
         description: dto.description ?? null,
       });
+      // 操作审计（尽力而为）
+      await this.audit.record({
+        operatorId,
+        action: AUDIT_ACTIONS.ROLE_CREATE,
+        resourceType: 'role',
+        resourceId: saved.id,
+        detail: { code: saved.code, name: saved.name },
+        ip,
+      });
+      return saved;
     } catch (err: unknown) {
       // 并发创建同名角色：唯一索引冲突兜底（统一走 isUniqueViolation，与 auth/users 同口径）
       if (isUniqueViolation(err)) {
@@ -101,7 +119,13 @@ export class RbacService {
   }
 
   /** 更新角色：只允许 name/description（code 不可改，DTO 无该字段）；系统角色 403 */
-  async updateRole(id: string, dto: UpdateRoleDto): Promise<Role> {
+  async updateRole(
+    id: string,
+    dto: UpdateRoleDto,
+    operatorId: string,
+    /** 操作者 IP（controller 透传 req.ip，落 audit_logs） */
+    ip?: string,
+  ): Promise<Role> {
     const role = await this.roles.findOneBy({ id });
     if (!role) {
       throw new NotFoundException('角色不存在');
@@ -116,11 +140,30 @@ export class RbacService {
     if (dto.description !== undefined) {
       role.description = dto.description;
     }
-    return this.roles.save(role);
+    const saved = await this.roles.save(role);
+    // 操作审计（尽力而为）
+    await this.audit.record({
+      operatorId,
+      action: AUDIT_ACTIONS.ROLE_UPDATE,
+      resourceType: 'role',
+      resourceId: id,
+      detail: {
+        code: role.code,
+        name: role.name,
+        description: role.description,
+      },
+      ip,
+    });
+    return saved;
   }
 
   /** 删除角色（软删）：系统角色 403；仍有关联用户 409（先解绑再删） */
-  async deleteRole(id: string): Promise<void> {
+  async deleteRole(
+    id: string,
+    operatorId: string,
+    /** 操作者 IP（controller 透传 req.ip，落 audit_logs） */
+    ip?: string,
+  ): Promise<void> {
     const role = await this.roles.findOneBy({ id });
     if (!role) {
       throw new NotFoundException('角色不存在');
@@ -144,6 +187,15 @@ export class RbacService {
       await manager.getRepository(RolePermission).delete({ roleId: id });
       await manager.getRepository(Role).softDelete({ id });
     });
+    // 操作审计（尽力而为）
+    await this.audit.record({
+      operatorId,
+      action: AUDIT_ACTIONS.ROLE_DELETE,
+      resourceType: 'role',
+      resourceId: id,
+      detail: { code: role.code },
+      ip,
+    });
   }
 
   /**
@@ -160,6 +212,8 @@ export class RbacService {
     roleId: string,
     permissionIds: string[],
     operatorId: string,
+    /** 操作者 IP（controller 透传 req.ip，落 audit_logs） */
+    ip?: string,
   ): Promise<void> {
     const role = await this.roles.findOneBy({ id: roleId });
     if (!role) {
@@ -187,6 +241,15 @@ export class RbacService {
         );
       }
     });
+    // 操作审计（尽力而为）
+    await this.audit.record({
+      operatorId,
+      action: AUDIT_ACTIONS.ROLE_PERMISSIONS_ASSIGN,
+      resourceType: 'role',
+      resourceId: roleId,
+      detail: { permissionIds: ids },
+      ip,
+    });
   }
 
   /**
@@ -203,7 +266,9 @@ export class RbacService {
   ): Promise<void> {
     const operator = await this.users.findOne({
       where: { id: operatorId },
-      relations: { roles: { permissions: true } },
+      relations: {
+        userRoles: { role: { rolePermissions: { permission: true } } },
+      },
     });
     // JwtAuthGuard 已保证操作者存在且 active；此处防御性兜底
     if (!operator) {

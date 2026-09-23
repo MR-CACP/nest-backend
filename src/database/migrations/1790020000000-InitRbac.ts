@@ -33,6 +33,14 @@ export class InitRbac1790020000000 implements MigrationInterface {
     await queryRunner.query(
       `ALTER TABLE "user_roles" ADD CONSTRAINT "FK_user_roles_role" FOREIGN KEY ("role_id") REFERENCES "roles"("id") ON DELETE CASCADE ON UPDATE NO ACTION`,
     );
+    // FK 列索引：TypeORM 不会为显式 @OneToMany 连接表自动建索引，
+    // 手写迁移与实体 @Index 同步声明（对齐审计模块做法），避免按外键查询全表扫描
+    await queryRunner.query(
+      `CREATE INDEX "idx_user_roles_user" ON "user_roles" ("user_id")`,
+    );
+    await queryRunner.query(
+      `CREATE INDEX "idx_user_roles_role" ON "user_roles" ("role_id")`,
+    );
     // 角色-权限连接表
     await queryRunner.query(
       `CREATE TABLE "role_permissions" ("role_id" bigint NOT NULL, "permission_id" bigint NOT NULL, "created_at" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(), CONSTRAINT "PK_role_permissions" PRIMARY KEY ("role_id", "permission_id"))`,
@@ -42,6 +50,12 @@ export class InitRbac1790020000000 implements MigrationInterface {
     );
     await queryRunner.query(
       `ALTER TABLE "role_permissions" ADD CONSTRAINT "FK_role_permissions_perm" FOREIGN KEY ("permission_id") REFERENCES "permissions"("id") ON DELETE CASCADE ON UPDATE NO ACTION`,
+    );
+    await queryRunner.query(
+      `CREATE INDEX "idx_role_permissions_role" ON "role_permissions" ("role_id")`,
+    );
+    await queryRunner.query(
+      `CREATE INDEX "idx_role_permissions_perm" ON "role_permissions" ("permission_id")`,
     );
     // 种子：系统角色（is_system=true）。INSERT ... WHERE NOT EXISTS 保证幂等
     //（重跑迁移不会重复插入；已有同名 code 时跳过）
@@ -54,7 +68,11 @@ export class InitRbac1790020000000 implements MigrationInterface {
   }
 
   public async down(queryRunner: QueryRunner): Promise<void> {
+    await queryRunner.query(`DROP INDEX "public"."idx_role_permissions_perm"`);
+    await queryRunner.query(`DROP INDEX "public"."idx_role_permissions_role"`);
     await queryRunner.query(`DROP TABLE "role_permissions"`);
+    await queryRunner.query(`DROP INDEX "public"."idx_user_roles_role"`);
+    await queryRunner.query(`DROP INDEX "public"."idx_user_roles_user"`);
     await queryRunner.query(`DROP TABLE "user_roles"`);
     await queryRunner.query(`DROP INDEX "public"."UQ_roles_code_active"`);
     await queryRunner.query(`DROP TABLE "roles"`);

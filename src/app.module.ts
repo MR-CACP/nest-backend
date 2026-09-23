@@ -26,6 +26,7 @@ import { envValidationSchema } from './config/env.validation';
 import type { NodeEnv, ThrottlerConfig } from './config/types';
 import { DatabaseModule } from './database/database.module';
 import { HealthModule } from './health/health.module';
+import { AuditModule } from './modules/audit/audit.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { RbacModule } from './modules/rbac/rbac.module';
 import { SessionsModule } from './modules/sessions/sessions.module';
@@ -132,6 +133,8 @@ const nodeEnv = (process.env.NODE_ENV ?? 'development') as NodeEnv;
     HealthModule,
     // 认证模块：本阶段注册 User / RefreshToken 数据模型（实体见 src/modules/auth/entities）
     AuthModule,
+    // 审计模块：login_logs（登录日志）+ audit_logs（管理操作审计）写入与查询
+    AuditModule,
     // RBAC 权限体系：roles/permissions 数据模型 + RolesGuard 授权守卫
     // （接口用 @UseGuards(JwtAuthGuard, RolesGuard) + @Roles/@Permissions 声明）
     RbacModule,

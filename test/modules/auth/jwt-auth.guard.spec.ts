@@ -148,7 +148,10 @@ describe('JwtAuthGuard', () => {
     // needsRbac=true → findOne + relations（预加载 RBAC 关系），不是 findOneBy
     expect(users.findOne).toHaveBeenCalledWith({
       where: { id: '7' },
-      relations: { roles: { permissions: true } },
+      // 连接表新形状：userRoles.role.rolePermissions.permission（getter 展开 roles/permissions）
+      relations: {
+        userRoles: { role: { rolePermissions: { permission: true } } },
+      },
     });
     expect(users.findOneBy).not.toHaveBeenCalled();
     // 完整实体（含 roles.permissions）挂到 request.userEntity 供 RolesGuard 复用

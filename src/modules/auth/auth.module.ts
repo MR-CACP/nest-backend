@@ -4,6 +4,7 @@ import { JwtModule, type JwtModuleOptions } from '@nestjs/jwt';
 import { TypeOrmModule } from '@nestjs/typeorm';
 
 import type { JwtConfig } from '../../config/types';
+import { LoginLog } from '../audit/entities/login-log.entity';
 import { Permission } from '../rbac/entities/permission.entity';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
@@ -34,7 +35,7 @@ export function buildJwtModuleOptions(
  */
 @Module({
   imports: [
-    TypeOrmModule.forFeature([User, RefreshToken, Permission]),
+    TypeOrmModule.forFeature([User, RefreshToken, Permission, LoginLog]),
     JwtModule.registerAsync({
       inject: [ConfigService],
       useFactory: buildJwtModuleOptions,

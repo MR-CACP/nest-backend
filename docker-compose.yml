@@ -23,11 +23,14 @@ services:
       TZ: UTC
       PGTZ: UTC
     ports:
-      - '${DB_PORT:-5432}:5432'
+      # 仅绑定本机回环：开发凭证可预测，绑 0.0.0.0 在共享网络上会被意外访问；
+      # 需远程调试时显式改为 '${DB_PORT:-5432}:5432'
+      - '127.0.0.1:${DB_PORT:-5432}:5432'
     volumes:
-      # 官方镜像 PGDATA=/var/lib/postgresql/data：挂载数据目录本身而非父目录，
-      # 与镜像默认布局对齐（同一卷内容不受影响）
-      - postgres-data:/var/lib/postgresql/data
+      # postgres:18+ 官方镜像要求挂载父目录 /var/lib/postgresql（数据落在版本子目录
+      # /var/lib/postgresql/18/docker，见 docker-library/postgres#1259）；挂载
+      # /var/lib/postgresql/data 会被 entrypoint 判定为"未使用的挂载"而拒绝启动
+      - postgres-data:/var/lib/postgresql
       # 首次初始化（空数据卷）时执行：额外创建 e2e 用的 nest_test 库
       - ./docker/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
@@ -57,7 +60,8 @@ services:
         'exec redis-server --requirepass "$$REDIS_PASSWORD" --appendonly yes',
       ]
     ports:
-      - '${REDIS_PORT:-6379}:6379'
+      # 同上：仅本机回环，避免 Redis 裸暴露在共享网络
+      - '127.0.0.1:${REDIS_PORT:-6379}:6379'
     volumes:
       - redis-data:/data
     healthcheck:

@@ -124,8 +124,11 @@ export class UsersController {
   @Post('users')
   @Permissions(PERMISSION_CODES.USER_CREATE)
   @ApiCreatedResponse({ description: '创建成功', schema: ADMIN_USER_SCHEMA })
-  createUser(@Body() dto: CreateUserDto): Promise<AdminUser> {
-    return this.usersService.createUser(dto);
+  createUser(
+    @Body() dto: CreateUserDto,
+    @Req() req: AuthenticatedRequest,
+  ): Promise<AdminUser> {
+    return this.usersService.createUser(dto, req.user.id, req.ip);
   }
 
   /** 更新用户资料（不含登录标识与状态） */
@@ -136,8 +139,9 @@ export class UsersController {
   updateUser(
     @Param('id') id: string,
     @Body() dto: UpdateUserDto,
+    @Req() req: AuthenticatedRequest,
   ): Promise<AdminUser> {
-    return this.usersService.updateUser(id, dto);
+    return this.usersService.updateUser(id, dto, req.user.id, req.ip);
   }
 
   /** 修改用户状态（active/disabled/banned；非 active 即撤销该用户全部会话） */
@@ -151,7 +155,7 @@ export class UsersController {
     @Req() req: AuthenticatedRequest,
   ): Promise<AdminUser> {
     // operatorId 用于降级防护：非 admin 不得禁用/变更管理员账号
-    return this.usersService.updateUserStatus(id, dto, req.user.id);
+    return this.usersService.updateUserStatus(id, dto, req.user.id, req.ip);
   }
 
   /** 给用户分配角色（整体替换；空数组 = 清空） */
@@ -165,6 +169,11 @@ export class UsersController {
     @Req() req: AuthenticatedRequest,
   ): Promise<void> {
     // operatorId 用于提权防护：只能分配操作者自己拥有的角色（admin 旁路例外）
-    return this.usersService.assignUserRoles(id, dto.roleIds, req.user.id);
+    return this.usersService.assignUserRoles(
+      id,
+      dto.roleIds,
+      req.user.id,
+      req.ip,
+    );
   }
 }

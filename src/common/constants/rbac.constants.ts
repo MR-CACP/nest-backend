@@ -35,4 +35,6 @@ export const PERMISSION_CODES = {
   SESSION_READ: 'session:read',
   /** 强制下线（单个会话或某用户全部会话） */
   SESSION_REVOKE: 'session:revoke',
+  /** 查看审计日志（登录日志 + 管理操作审计） */
+  AUDIT_READ: 'audit:read',
 } as const;

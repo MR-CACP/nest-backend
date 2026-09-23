@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 
+import { AuditModule } from '../audit/audit.module';
 import { AuthModule } from '../auth/auth.module';
 import { RefreshToken } from '../auth/entities/refresh-token.entity';
 import { User } from '../auth/entities/user.entity';
@@ -20,6 +21,7 @@ import { SessionsService } from './sessions.service';
 @Module({
   imports: [
     AuthModule,
+    AuditModule,
     RbacModule,
     TypeOrmModule.forFeature([RefreshToken, User]),
   ],

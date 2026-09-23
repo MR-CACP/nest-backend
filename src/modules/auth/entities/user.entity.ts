@@ -5,13 +5,13 @@ import {
   DeleteDateColumn,
   Entity,
   Index,
-  JoinTable,
-  ManyToMany,
+  OneToMany,
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
 
 import { Role } from '../../rbac/entities/role.entity';
+import { UserRole } from '../../rbac/entities/user-role.entity';
 
 /**
  * 用户实体（users 表）：平台自有身份的主数据。
@@ -36,6 +36,9 @@ import { Role } from '../../rbac/entities/role.entity';
 @Entity('users')
 @Check(`status IN ('active', 'disabled', 'banned')`)
 @Check(`gender IS NULL OR gender IN ('male', 'female', 'other')`)
+// 管理端用户列表按 (created_at DESC, id DESC) 分页（见 users.service）——
+// 复合索引覆盖排序路径，避免大表文件排序；实体声明 + 迁移同步（防 schema:log 漂移）
+@Index('idx_users_created_id', ['createdAt', 'id'])
 export class User {
   /** 主键：bigserial。注意 bigint 由 pg 驱动返回 string（避免 JS 精度丢失） */
   @PrimaryGeneratedColumn({ type: 'bigint' })
@@ -117,17 +120,26 @@ export class User {
   sessionVersion: number;
 
   /**
-   * 用户角色（经 user_roles 连接表，多对多）：RBAC 权限判定的数据来源。
-   * RolesGuard 每请求加载 roles.permissions 做授权；/me 返回角色码与权限码并集。
-   * 关系加载自动过滤软删角色（Role 实体有 @DeleteDateColumn）。
+   * 用户角色分配（user_roles 连接表行）：管理端增删分配直接 CRUD 此实体。
+   * 为何不是 @ManyToMany/@JoinTable：显式连接表实体是 user_roles 的唯一元数据源
+   * （双声明会让 TypeORM 生成两组 FK，schema:log 永久漂移）；@OneToMany 反向
+   * 引用连接表实体的 @ManyToOne，关系加载与写入都走同一份定义。
    */
-  @ManyToMany(() => Role, (role) => role.users)
-  @JoinTable({
-    name: 'user_roles',
-    joinColumn: { name: 'user_id', referencedColumnName: 'id' },
-    inverseJoinColumn: { name: 'role_id', referencedColumnName: 'id' },
-  })
-  roles: Role[];
+  @OneToMany(() => UserRole, (ur) => ur.user)
+  userRoles: UserRole[];
+
+  /**
+   * 角色集合（userRoles.role 展开）：RBAC 判定与 /me 使用。
+   * getter 让调用方保持 user.roles 形状；**加载关系时必须带 userRoles.role**
+   * （如 relations: { userRoles: { role: true } }），否则返回 []。
+   * 注意：getter 不参与序列化——对外响应仍走显式投影（toSafeUser/toAdminUser）。
+   */
+  get roles(): Role[] {
+    // 连接表行的关联可空（ur.role?: Role），过滤后断言非空
+    return (this.userRoles ?? [])
+      .map((ur) => ur.role)
+      .filter((r): r is Role => r != null);
+  }
 
   /** 创建时间（TypeORM 自动填充） */
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })

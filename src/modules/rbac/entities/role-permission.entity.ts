@@ -1,6 +1,7 @@
 import {
   CreateDateColumn,
   Entity,
+  Index,
   JoinColumn,
   ManyToOne,
   PrimaryColumn,
@@ -18,6 +19,9 @@ import { Role } from './role.entity';
  * - FK 均 ON DELETE CASCADE：删除角色/权限点时关联自动清理。
  */
 @Entity('role_permissions')
+// FK 列索引：与 user_roles 同款（手写迁移 + 实体同步声明，避免全表扫描）
+@Index('idx_role_permissions_role', ['roleId'])
+@Index('idx_role_permissions_perm', ['permissionId'])
 export class RolePermission {
   /** 角色 ID（联合主键之一，FK → roles.id） */
   @PrimaryColumn({ name: 'role_id', type: 'bigint' })
@@ -33,11 +37,18 @@ export class RolePermission {
 
   /** 关联角色 */
   @ManyToOne(() => Role, { onDelete: 'CASCADE' })
-  @JoinColumn({ name: 'role_id' })
+  // foreignKeyConstraintName 对齐 InitRbac 迁移的手写约束名（同上，避免 schema:log 改名重建）
+  @JoinColumn({
+    name: 'role_id',
+    foreignKeyConstraintName: 'FK_role_permissions_role',
+  })
   role?: Role;
 
   /** 关联权限点 */
   @ManyToOne(() => Permission, { onDelete: 'CASCADE' })
-  @JoinColumn({ name: 'permission_id' })
+  @JoinColumn({
+    name: 'permission_id',
+    foreignKeyConstraintName: 'FK_role_permissions_perm',
+  })
   permission?: Permission;
 }

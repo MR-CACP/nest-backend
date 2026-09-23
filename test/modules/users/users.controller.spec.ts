@@ -42,15 +42,21 @@ describe('UsersController', () => {
   it('createUser：透传 DTO', async () => {
     const dto = { username: 'u', password: 'secret123' };
     service.createUser.mockResolvedValue({ id: '1' });
-    await controller.createUser(dto);
-    expect(service.createUser).toHaveBeenCalledWith(dto);
+    await controller.createUser(dto, {
+      user: { id: 'op' },
+      ip: '1.2.3.4',
+    } as never);
+    expect(service.createUser).toHaveBeenCalledWith(dto, 'op', '1.2.3.4');
   });
 
   it('updateUser：透传 id + DTO', async () => {
     const dto = { nickname: 'x' };
     service.updateUser.mockResolvedValue({ id: '7' });
-    await controller.updateUser('7', dto);
-    expect(service.updateUser).toHaveBeenCalledWith('7', dto);
+    await controller.updateUser('7', dto, {
+      user: { id: 'op' },
+      ip: '1.2.3.4',
+    } as never);
+    expect(service.updateUser).toHaveBeenCalledWith('7', dto, 'op', '1.2.3.4');
   });
 
   it('updateUserStatus：透传 id + DTO + 操作者 ID', async () => {
@@ -58,19 +64,27 @@ describe('UsersController', () => {
     service.updateUserStatus.mockResolvedValue({ id: '7', status: 'disabled' });
     await controller.updateUserStatus('7', dto, {
       user: { id: 'op' },
+      ip: '1.2.3.4',
     } as never);
-    expect(service.updateUserStatus).toHaveBeenCalledWith('7', dto, 'op');
+    expect(service.updateUserStatus).toHaveBeenCalledWith(
+      '7',
+      dto,
+      'op',
+      '1.2.3.4',
+    );
   });
 
   it('assignUserRoles：拆出 roleIds + 操作者 ID 传给 service', async () => {
     service.assignUserRoles.mockResolvedValue(undefined);
     await controller.assignUserRoles('7', { roleIds: ['r1', 'r2'] }, {
       user: { id: 'op' },
+      ip: '1.2.3.4',
     } as never);
     expect(service.assignUserRoles).toHaveBeenCalledWith(
       '7',
       ['r1', 'r2'],
       'op',
+      '1.2.3.4',
     );
   });
 });

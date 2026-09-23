@@ -25,18 +25,19 @@ describe('RolesGuard', () => {
   let guard: RolesGuard;
   let users: { findOne: jest.Mock };
 
-  const makeRole = (code: string, permissionCodes: string[]): Role => ({
-    id: '1',
-    code,
-    name: code,
-    description: null,
-    isSystem: false,
-    permissions: permissionCodes.map((pc) => ({ code: pc }) as Permission),
-    users: [],
-    createdAt: new Date(),
-    updatedAt: new Date(),
-    deletedAt: null,
-  });
+  const makeRole = (code: string, permissionCodes: string[]): Role =>
+    ({
+      id: '1',
+      code,
+      name: code,
+      description: null,
+      isSystem: false,
+      // 普通属性（mock 不经 TypeORM，getter 不生效）：guard 读 role.permissions 需运行期数组
+      permissions: permissionCodes.map((pc) => ({ code: pc }) as Permission),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      deletedAt: null,
+    }) as unknown as Role;
 
   const makeUser = (roles: Role[]): User =>
     ({
@@ -54,6 +55,7 @@ describe('RolesGuard', () => {
       phoneVerifiedAt: null,
       status: 'active',
       sessionVersion: 0,
+      // 普通属性 roles：guard 读 user.roles 需要运行期数组
       roles,
       createdAt: new Date(),
       updatedAt: new Date(),

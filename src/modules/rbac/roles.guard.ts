@@ -70,7 +70,9 @@ export class RolesGuard implements CanActivate {
       request.userEntity ??
       (await this.users.findOne({
         where: { id: request.user.id },
-        relations: { roles: { permissions: true } },
+        relations: {
+          userRoles: { role: { rolePermissions: { permission: true } } },
+        },
       }));
     if (!user) {
       // JwtAuthGuard 已保证用户存在且 active；此处兜底防御

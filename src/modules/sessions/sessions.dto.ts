@@ -8,6 +8,8 @@ export class ListSessionsQuery {
   @Type(() => Number)
   @IsInt({ message: '页码必须是整数' })
   @Min(1, { message: '页码不能小于 1' })
+  // 上界防护：超大 page 会让 (page-1)*pageSize 溢出 bigint 触发 PG 22003 → 500
+  @Max(1_000_000, { message: '页码不能超过 1000000' })
   page?: number;
 
   /** 每页条数（上限 100） */

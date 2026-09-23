@@ -8,6 +8,7 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, EntityManager, In, IsNull, Repository } from 'typeorm';
 
+import { AUDIT_ACTIONS } from '../../common/constants/audit.constants';
 import { ADMIN_ROLE_CODE } from '../../common/constants/rbac.constants';
 import {
   assertPasswordByteLength,
@@ -17,6 +18,7 @@ import {
   normalizePhone,
 } from '../../common/utils/account';
 import { assertNoAdminDowngrade } from '../../common/utils/admin-guard';
+import { AuditService } from '../audit/audit.service';
 import { RefreshToken } from '../auth/entities/refresh-token.entity';
 import { User } from '../auth/entities/user.entity';
 import { Role } from '../rbac/entities/role.entity';
@@ -82,6 +84,7 @@ export class UsersService {
     @InjectRepository(UserRole)
     private readonly userRoles: Repository<UserRole>,
     private readonly dataSource: DataSource,
+    private readonly audit: AuditService,
   ) {}
 
   /** 用户分页列表（含角色码；软删默认过滤） */
@@ -94,8 +97,10 @@ export class UsersService {
     const page = Math.max(1, query.page ?? 1);
     const pageSize = Math.min(100, Math.max(1, query.pageSize ?? 10));
     const [items, total] = await this.users.findAndCount({
-      relations: { roles: true },
-      order: { createdAt: 'DESC' },
+      relations: { userRoles: { role: true } },
+      // (createdAt, id) 双键排序：同一秒创建的行在 offset 翻页时不漂移
+      //（单键排序同时间戳行会重复/遗漏；索引见 idx_users_created_id 迁移）
+      order: { createdAt: 'DESC', id: 'DESC' },
       skip: (page - 1) * pageSize,
       take: pageSize,
     });
@@ -133,11 +138,13 @@ export class UsersService {
     userId: string,
     roleIds: string[],
     operatorId: string,
+    /** 操作者 IP（controller 透传 req.ip，落 audit_logs） */
+    ip?: string,
   ): Promise<void> {
     // 目标含 roles：降级防护需要判断目标是否持有 admin 角色
     const user = await this.users.findOne({
       where: { id: userId },
-      relations: { roles: true },
+      relations: { userRoles: { role: true } },
     });
     if (!user) {
       throw new NotFoundException('用户不存在');
@@ -152,7 +159,7 @@ export class UsersService {
     // 操作者只查一次，供降级/提权/最后 admin 三个校验共用（低频管理路径去重）
     const operator = await this.users.findOne({
       where: { id: operatorId },
-      relations: { roles: true },
+      relations: { userRoles: { role: true } },
     });
     if (!operator) {
       throw new ForbiddenException('没有访问权限');
@@ -188,6 +195,15 @@ export class UsersService {
         await urRepo.insert(ids.map((roleId) => ({ userId, roleId })));
       }
     });
+    // 操作审计（尽力而为：写入失败不影响分配结果）
+    await this.audit.record({
+      operatorId,
+      action: AUDIT_ACTIONS.USER_ROLES_ASSIGN,
+      resourceType: 'user',
+      resourceId: userId,
+      detail: { roleIds: ids },
+      ip,
+    });
   }
 
   /**
@@ -195,7 +211,12 @@ export class UsersService {
    * 保证管理端创建的用户能正常登录；唯一性冲突（含并发）映射 409。
    * 不分配角色（调用方按需走 assignUserRoles），新用户 status 默认 active。
    */
-  async createUser(dto: CreateUserDto): Promise<AdminUser> {
+  async createUser(
+    dto: CreateUserDto,
+    operatorId: string,
+    /** 操作者 IP（controller 透传 req.ip，落 audit_logs） */
+    ip?: string,
+  ): Promise<AdminUser> {
     assertPasswordByteLength(dto.password);
     await this.ensureAccountAvailable(dto);
     const passwordHash = await hashPassword(dto.password);
@@ -209,6 +230,15 @@ export class UsersService {
           passwordHash,
         }),
       );
+      // 操作审计（尽力而为）
+      await this.audit.record({
+        operatorId,
+        action: AUDIT_ACTIONS.USER_CREATE,
+        resourceType: 'user',
+        resourceId: saved.id,
+        detail: { username: saved.username },
+        ip,
+      });
       return this.toAdminUser(saved);
     } catch (err) {
       if (isUniqueViolation(err)) {
@@ -225,7 +255,13 @@ export class UsersService {
    * 状态修改走 updateUserStatus（独立权限点）。
    * 写操作一律以主键 id 定位（局部唯一索引下按标识写会连历史行一起命中）。
    */
-  async updateUser(id: string, dto: UpdateUserDto): Promise<AdminUser> {
+  async updateUser(
+    id: string,
+    dto: UpdateUserDto,
+    operatorId: string,
+    /** 操作者 IP（controller 透传 req.ip，落 audit_logs） */
+    ip?: string,
+  ): Promise<AdminUser> {
     const user = await this.users.findOneBy({ id });
     if (!user) {
       throw new NotFoundException('用户不存在');
@@ -247,6 +283,25 @@ export class UsersService {
     if (!saved) {
       throw new NotFoundException('用户不存在');
     }
+    // 操作审计（尽力而为）：只记实际变更的字段名，不落字段值（资料含 PII）。
+    // Object.keys(dto) = 本次请求实际传入的键（JSON body 不会带 undefined 键），
+    // 与上方逐字段守卫写入的集合一致；DTO 加字段自动纳入，无需维护第二份列表。
+    await this.audit.record({
+      operatorId,
+      action: AUDIT_ACTIONS.USER_UPDATE,
+      resourceType: 'user',
+      resourceId: id,
+      detail: {
+        // 只记客户端**实际传入**的字段：ValidationPipe transform:true 走
+        // plainToInstance，会把 DTO 所有声明字段变成自有属性（值 undefined）——
+        // 直接 Object.keys(dto) 会把未改动字段全部记为已改动，审计失真。
+        // 按值过滤 undefined 才是"客户端传入集"（显式传 null 清空字段仍记为已改动）
+        changed: Object.entries(dto)
+          .filter(([, value]) => value !== undefined)
+          .map(([key]) => key),
+      },
+      ip,
+    });
     return this.toAdminUser(saved);
   }
 
@@ -264,11 +319,13 @@ export class UsersService {
     id: string,
     dto: UpdateUserStatusDto,
     operatorId: string,
+    /** 操作者 IP（controller 透传 req.ip，落 audit_logs） */
+    ip?: string,
   ): Promise<AdminUser> {
     // 目标含 roles：降级防护需要判断目标是否持有 admin 角色
     const user = await this.users.findOne({
       where: { id },
-      relations: { roles: true },
+      relations: { userRoles: { role: true } },
     });
     if (!user) {
       throw new NotFoundException('用户不存在');
@@ -276,7 +333,7 @@ export class UsersService {
     // 降级防护：非 admin 操作者不得禁用/变更管理员账号（防止内部锁死超管）
     const operator = await this.users.findOne({
       where: { id: operatorId },
-      relations: { roles: true },
+      relations: { userRoles: { role: true } },
     });
     if (!operator) {
       throw new ForbiddenException('没有访问权限');
@@ -320,7 +377,8 @@ export class UsersService {
         (
           await manager.getRepository(User).findOne({
             where: { id },
-            relations: { roles: true },
+            // 连接表新形状：userRoles.role（getter 展开 roles）
+            relations: { userRoles: { role: true } },
           })
         )?.roles ?? [];
       // ④ 事务内复核降级防护：非 admin 操作者 + 目标（锁后）已持 admin → 403。
@@ -333,6 +391,9 @@ export class UsersService {
       if (leavingActive) {
         lockedUser.sessionVersion += 1;
       }
+      // 审计 from 需捕获**变更前**的锁内状态：必须先存再改（在 status 赋值前取，
+      // 否则取到的是新状态）；并发下锁内值才是权威，事务外快照可能已过期
+      const fromStatus = lockedUser.status;
       lockedUser.status = dto.status;
       // save 与 revoke 必须同生共死：先落状态后撤销失败会留下
       // revokedAt IS NULL 的活跃会话行（审计视图失真）。
@@ -356,9 +417,20 @@ export class UsersService {
             { revokedAt: new Date() },
           );
       }
-      return savedUser;
+      return { savedUser, fromStatus };
     });
-    return this.toAdminUser(saved);
+    // 操作审计（尽力而为）：状态转换（from → to）是审计核心信息。
+    // from 必须用**事务锁内**的 lockedUser.status：并发下事务外快照 user.status
+    // 可能已过期（如另一请求刚把它改为 disabled），记成 active→banned 会失真
+    await this.audit.record({
+      operatorId,
+      action: AUDIT_ACTIONS.USER_STATUS_UPDATE,
+      resourceType: 'user',
+      resourceId: id,
+      detail: { from: saved.fromStatus, to: dto.status },
+      ip,
+    });
+    return this.toAdminUser(saved.savedUser);
   }
 
   /**

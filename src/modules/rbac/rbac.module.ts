@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 
+import { AuditModule } from '../audit/audit.module';
 import { AuthModule } from '../auth/auth.module';
 import { User } from '../auth/entities/user.entity';
 import { Permission } from './entities/permission.entity';
@@ -23,6 +24,7 @@ import { RolesGuard } from './roles.guard';
     // RbacController 直接使用 JwtAuthGuard，需要 JwtService 在解析链上：
     // AuthModule 导出 JwtModule，import 后本模块控制器可解析（单向依赖，无循环）
     AuthModule,
+    AuditModule,
     TypeOrmModule.forFeature([
       Role,
       Permission,

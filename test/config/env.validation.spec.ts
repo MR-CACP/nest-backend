@@ -244,6 +244,35 @@ describe('envValidationSchema', () => {
       expect(error).toBeUndefined();
     });
 
+    describe('TRUST_PROXY 跳数上界', () => {
+      it.each([
+        ['11', '11'], // 超过 10 层的跳数配置（多层代理极端罕见，无界信任任意 XFF）
+        ['999', '999'],
+        ['abc', 'abc'], // 非数字/布尔值
+        ['', ''],
+      ])('非法值 %j 被拒绝（防无界信任 X-Forwarded-For）', (raw) => {
+        const { error } = envValidationSchema.validate({
+          ...validEnv,
+          TRUST_PROXY: raw,
+        });
+        expect(error).toBeDefined();
+        expect(error?.details.some((d) => d.path.includes('TRUST_PROXY'))).toBe(
+          true,
+        );
+      });
+
+      it.each(['false', 'true', '0', '3', '10'])(
+        '合法值 %j 通过（0-10 跳数 + true/false）',
+        (raw) => {
+          const { error } = envValidationSchema.validate({
+            ...validEnv,
+            TRUST_PROXY: raw,
+          });
+          expect(error).toBeUndefined();
+        },
+      );
+    });
+
     it('超出 PG 毫秒 GUC 上界（int32 max）被拒绝', () => {
       const { error } = envValidationSchema.validate({
         ...validEnv,

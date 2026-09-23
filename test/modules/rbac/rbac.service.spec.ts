@@ -9,20 +9,22 @@ import type { DataSource } from 'typeorm';
 import { Role } from '@/modules/rbac/entities/role.entity';
 import { RbacService } from '@/modules/rbac/rbac.service';
 
-/** 构造最小 Role（isSystem 可覆盖） */
-const makeRole = (overrides: Partial<Role> = {}): Role => ({
-  id: '1',
-  code: 'editor',
-  name: '编辑',
-  description: null,
-  isSystem: false,
-  permissions: [],
-  users: [],
-  createdAt: new Date(),
-  updatedAt: new Date(),
-  deletedAt: null,
-  ...overrides,
-});
+/** 构造最小 Role（isSystem 可覆盖）；permissions/users 现为 getter，mock 用连接表结构 */
+const makeRole = (overrides: Partial<Role> = {}): Role =>
+  ({
+    id: '1',
+    code: 'editor',
+    name: '编辑',
+    description: null,
+    isSystem: false,
+    // 普通属性（mock 不经 TypeORM，getter 不生效）
+    permissions: [],
+    users: [],
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    deletedAt: null,
+    ...overrides,
+  }) as unknown as Role;
 
 /**
  * RbacService 单测：管理端保护逻辑（系统角色只读 / 冲突 / 事务整体替换）。
@@ -44,6 +46,9 @@ describe('RbacService', () => {
   let users: { findOne: jest.Mock };
   let txRepos: { delete: jest.Mock; insert: jest.Mock; softDelete: jest.Mock };
 
+  // 操作审计 mock：顶层声明，it 回调可直接断言 record 调用
+  let audit: { record: jest.Mock };
+
   beforeEach(() => {
     roles = {
       findOne: jest.fn(),
@@ -57,6 +62,7 @@ describe('RbacService', () => {
     rolePermissions = { find: jest.fn() };
     users = { findOne: jest.fn() };
     txRepos = { delete: jest.fn(), insert: jest.fn(), softDelete: jest.fn() };
+    audit = { record: jest.fn() };
     const dataSource = {
       transaction: jest.fn((cb: (m: unknown) => Promise<unknown>) => {
         // manager 返回独立 txRepo（与默认仓库 mock 区分——验证事务内走 manager）
@@ -71,6 +77,7 @@ describe('RbacService', () => {
       rolePermissions as never,
       users as never,
       dataSource,
+      audit as never,
     );
   });
 
@@ -84,20 +91,32 @@ describe('RbacService', () => {
     it('成功创建（isSystem 恒为 false）', async () => {
       roles.findOne.mockResolvedValue(null);
       roles.save.mockImplementation((r: Partial<Role>) => makeRole(r));
-      const result = await service.createRole({
-        code: 'editor',
-        name: '编辑',
-      });
+      const result = await service.createRole(
+        {
+          code: 'editor',
+          name: '编辑',
+        },
+        'op',
+      );
       expect(result.isSystem).toBe(false);
       expect(roles.save).toHaveBeenCalledWith(
         expect.objectContaining({ code: 'editor', name: '编辑' }),
+      );
+      // 操作审计：动作码 + operatorId + resourceId + detail 透传
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'role.create',
+          operatorId: 'op',
+          resourceType: 'role',
+          detail: { code: 'editor', name: '编辑' },
+        }),
       );
     });
 
     it('code 已存在 → 409', async () => {
       roles.findOne.mockResolvedValue(makeRole());
       await expect(
-        service.createRole({ code: 'editor', name: '编辑' }),
+        service.createRole({ code: 'editor', name: '编辑' }, 'op'),
       ).rejects.toBeInstanceOf(ConflictException);
     });
 
@@ -106,7 +125,7 @@ describe('RbacService', () => {
       // mock 形状与 isUniqueViolation 鸭子类型一致（真 QueryFailedError 的 code 在 driverError 上）
       roles.save.mockRejectedValue({ driverError: { code: '23505' } });
       await expect(
-        service.createRole({ code: 'editor', name: '编辑' }),
+        service.createRole({ code: 'editor', name: '编辑' }, 'op'),
       ).rejects.toBeInstanceOf(ConflictException);
     });
   });
@@ -115,14 +134,14 @@ describe('RbacService', () => {
     it('角色不存在 → 404', async () => {
       roles.findOneBy.mockResolvedValue(null);
       await expect(
-        service.updateRole('1', { name: 'x' }),
+        service.updateRole('1', { name: 'x' }, 'op'),
       ).rejects.toBeInstanceOf(NotFoundException);
     });
 
     it('系统角色 → 403（完全只读）', async () => {
       roles.findOneBy.mockResolvedValue(makeRole({ isSystem: true }));
       await expect(
-        service.updateRole('1', { name: 'x' }),
+        service.updateRole('1', { name: 'x' }, 'op'),
       ).rejects.toBeInstanceOf(ForbiddenException);
     });
 
@@ -130,17 +149,30 @@ describe('RbacService', () => {
       const role = makeRole();
       roles.findOneBy.mockResolvedValue(role);
       roles.save.mockImplementation((r: Role) => r);
-      await service.updateRole('1', { name: '高级编辑', description: 'd' });
+      await service.updateRole(
+        '1',
+        { name: '高级编辑', description: 'd' },
+        'op',
+      );
       expect(role.name).toBe('高级编辑');
       expect(role.description).toBe('d');
       expect(role.code).toBe('editor'); // code 不可变
+      // 操作审计：动作码 + operatorId + resourceId 透传
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'role.update',
+          operatorId: 'op',
+          resourceType: 'role',
+          resourceId: '1',
+        }),
+      );
     });
 
     it('PATCH 部分更新：只传 name 不清空已有描述（undefined 不覆盖）', async () => {
       const role = makeRole({ description: '既有描述' });
       roles.findOneBy.mockResolvedValue(role);
       roles.save.mockImplementation((r: Role) => r);
-      await service.updateRole('1', { name: '仅改名' });
+      await service.updateRole('1', { name: '仅改名' }, 'op');
       expect(role.name).toBe('仅改名');
       expect(role.description).toBe('既有描述'); // 未被清空
     });
@@ -149,7 +181,7 @@ describe('RbacService', () => {
       const role = makeRole({ description: '既有描述' });
       roles.findOneBy.mockResolvedValue(role);
       roles.save.mockImplementation((r: Role) => r);
-      await service.updateRole('1', { name: '清空', description: '' });
+      await service.updateRole('1', { name: '清空', description: '' }, 'op');
       expect(role.description).toBe('');
     });
   });
@@ -157,14 +189,14 @@ describe('RbacService', () => {
   describe('deleteRole', () => {
     it('角色不存在 → 404', async () => {
       roles.findOneBy.mockResolvedValue(null);
-      await expect(service.deleteRole('1')).rejects.toBeInstanceOf(
+      await expect(service.deleteRole('1', 'op')).rejects.toBeInstanceOf(
         NotFoundException,
       );
     });
 
     it('系统角色 → 403', async () => {
       roles.findOneBy.mockResolvedValue(makeRole({ isSystem: true }));
-      await expect(service.deleteRole('1')).rejects.toBeInstanceOf(
+      await expect(service.deleteRole('1', 'op')).rejects.toBeInstanceOf(
         ForbiddenException,
       );
     });
@@ -172,7 +204,7 @@ describe('RbacService', () => {
     it('仍有关联用户 → 409（先解绑再删）', async () => {
       roles.findOneBy.mockResolvedValue(makeRole());
       userRoles.count.mockResolvedValue(2);
-      await expect(service.deleteRole('1')).rejects.toBeInstanceOf(
+      await expect(service.deleteRole('1', 'op')).rejects.toBeInstanceOf(
         ConflictException,
       );
     });
@@ -180,10 +212,20 @@ describe('RbacService', () => {
     it('无关联：事务内软删角色 + 清 role_permissions 绑定', async () => {
       roles.findOneBy.mockResolvedValue(makeRole());
       userRoles.count.mockResolvedValue(0);
-      await service.deleteRole('1');
+      await service.deleteRole('1', 'op');
       // 软删与清绑定都走 manager 仓库（默认仓库不受事务保护）
       expect(txRepos.delete).toHaveBeenCalledWith({ roleId: '1' });
       expect(txRepos.softDelete).toHaveBeenCalledWith({ id: '1' });
+      // 操作审计：role.delete 是唯一带 detail.code 的删除类审计
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'role.delete',
+          operatorId: 'op',
+          resourceType: 'role',
+          resourceId: '1',
+          detail: { code: 'editor' },
+        }),
+      );
     });
   });
 
@@ -214,6 +256,16 @@ describe('RbacService', () => {
         { roleId: '1', permissionId: '10' },
         { roleId: '1', permissionId: '11' },
       ]);
+      // 操作审计：detail.permissionIds 为去重后的 ID 列表
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'role.permissions.assign',
+          operatorId: 'op',
+          resourceType: 'role',
+          resourceId: '1',
+          detail: { permissionIds: ['10', '11'] },
+        }),
+      );
     });
 
     it('空数组 = 清空全部权限（合法语义，不校验）', async () => {

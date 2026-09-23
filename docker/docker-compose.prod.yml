@@ -118,9 +118,10 @@ services:
       TZ: UTC
       PGTZ: UTC
     volumes:
-      # 官方镜像 PGDATA=/var/lib/postgresql/data：挂载数据目录本身而非父目录，
-      # 与镜像默认布局对齐，避免升级/重排时路径歧义（同一卷内容不受影响）
-      - postgres-data:/var/lib/postgresql/data
+      # postgres:18+ 官方镜像要求挂载父目录 /var/lib/postgresql（数据落在版本子目录
+      # /var/lib/postgresql/18/docker，见 docker-library/postgres#1259）；挂载
+      # /var/lib/postgresql/data 会被 entrypoint 判定为"未使用的挂载"而拒绝启动
+      - postgres-data:/var/lib/postgresql
     healthcheck:
       test:
         [
