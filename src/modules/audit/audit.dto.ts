@@ -70,10 +70,10 @@ export class ListAuditLogsQueryDto {
   @IsString()
   operatorId?: string;
 
-  /** 按资源类型过滤（实际只有 user / role / session 三种；permission 永不产生） */
+  /** 按资源类型过滤（user / role / session / job；permission 永不产生） */
   @IsOptional()
-  @IsIn(['user', 'role', 'session'], {
-    message: '资源类型只能是 user / role / session',
+  @IsIn(['user', 'role', 'session', 'job'], {
+    message: '资源类型只能是 user / role / session / job',
   })
   resourceType?: string;
 }

@@ -7,10 +7,10 @@ import request from 'supertest';
 import { App } from 'supertest/types';
 import { IsNull, type Repository } from 'typeorm';
 
-import { AppModule } from './../src/app.module';
-import { configureApp } from './../src/app.setup';
-import { RefreshToken } from './../src/modules/auth/entities/refresh-token.entity';
-import { User } from './../src/modules/auth/entities/user.entity';
+import { AppModule } from '../../src/app.module';
+import { configureApp } from '../../src/app.setup';
+import { RefreshToken } from '../../src/modules/auth/entities/refresh-token.entity';
+import { User } from '../../src/modules/auth/entities/user.entity';
 
 /**
  * 认证接口 e2e：真实 PostgreSQL + 迁移后的 schema，覆盖

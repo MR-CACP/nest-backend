@@ -14,10 +14,10 @@ import { User } from '../../auth/entities/user.entity';
  * 操作审计：管理端写路径的"谁在何时对什么做了什么"（追加式，不更新不删除）。
  * 设计要点：
  * - 覆盖 users（创建/改资料/改状态/分配角色）、rbac（角色 CRUD/分配权限）、
- *   sessions（单会话/全部下线）的管理写操作；自助操作（register、/me）暂不记
+ *   sessions（单会话/全部下线）、jobs（任务 CRUD/启停/手动执行）的管理写操作；自助操作（register、/me）暂不记
  *   （范围克制，README 注明可扩展）；
  * - operator_id 用 SET NULL 外键：操作者被删后审计仍保留（审计完整性）；
- * - resource_id 不设外键（多态：user/role/session 的 id 形态不同），
+ * - resource_id 不设外键（多态：user/role/session/job 的 id 形态不同），
  *   检索靠 resource_type + resource_id 组合；
  * - detail 存变更摘要（如状态 from→to、分配的 roleIds），不落敏感字段
  *   （密码哈希、refresh 明文等一律不写）。
@@ -53,11 +53,11 @@ export class AuditLog {
   })
   operator: User | null;
 
-  /** 动作码（点分命名：user.create / role.update / session.revoke_all） */
+  /** 动作码（点分命名：user.create / role.update / session.revoke_all / job.run） */
   @Column({ name: 'action', type: 'varchar', length: 100 })
   action: string;
 
-  /** 资源类型（user / role / session；permission 永不产生——与查询 DTO 的 @IsIn 一致） */
+  /** 资源类型（user / role / session / job；permission 永不产生——与查询 DTO 的 @IsIn 一致） */
   // 公开筛选条件：单列索引避免追加式日志下的全表扫（与迁移一致）
   @Index('idx_audit_logs_resource_type')
   @Column({ name: 'resource_type', type: 'varchar', length: 50 })

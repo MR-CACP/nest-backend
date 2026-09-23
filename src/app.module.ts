@@ -4,6 +4,7 @@ import { ThrottlerStorageRedisService } from '@nest-lab/throttler-storage-redis'
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
+import { ScheduleModule } from '@nestjs/schedule';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import type { Redis } from 'ioredis';
 import { LoggerModule } from 'nestjs-pino';
@@ -13,6 +14,7 @@ import { TransformInterceptor } from './common/interceptors/transform.intercepto
 import { genRequestId } from './common/utils/request-id';
 import {
   appConfig,
+  cleanupConfig,
   corsConfig,
   databaseConfig,
   getEnvFilePaths,
@@ -28,6 +30,8 @@ import { DatabaseModule } from './database/database.module';
 import { HealthModule } from './health/health.module';
 import { AuditModule } from './modules/audit/audit.module';
 import { AuthModule } from './modules/auth/auth.module';
+import { CleanupModule } from './modules/cleanup/cleanup.module';
+import { JobsModule } from './modules/jobs/jobs.module';
 import { RbacModule } from './modules/rbac/rbac.module';
 import { SessionsModule } from './modules/sessions/sessions.module';
 import { UsersModule } from './modules/users/users.module';
@@ -65,6 +69,7 @@ const nodeEnv = (process.env.NODE_ENV ?? 'development') as NodeEnv;
         databaseConfig,
         redisConfig,
         jwtConfig,
+        cleanupConfig,
       ],
       validationSchema: envValidationSchema,
       // allowUnknown 无需设置：schema 中已声明 .unknown(true)
@@ -143,6 +148,12 @@ const nodeEnv = (process.env.NODE_ENV ?? 'development') as NodeEnv;
     UsersModule,
     // 会话管理模块：在线列表 + 强制下线（数据源 refresh_tokens + session_version 递增）
     SessionsModule,
+    // 定时调度基座（SchedulerRegistry 全局提供）+ 定时清理模块（动作执行目标）
+    ScheduleModule.forRoot(),
+    CleanupModule,
+    // 定时任务管理模块：job_definitions 表驱动动态调度（若依式调度中心）——
+    // 启动注册 + 管理端 CRUD/启停/手动执行 + 执行日志
+    JobsModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },

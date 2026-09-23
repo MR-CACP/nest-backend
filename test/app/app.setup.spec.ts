@@ -1,4 +1,4 @@
-import { readPkgVersion } from '../src/app.setup';
+import { readPkgVersion } from '../../src/app.setup';
 
 describe('readPkgVersion', () => {
   it('正常读取版本号', () => {

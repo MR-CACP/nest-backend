@@ -50,6 +50,7 @@
 - **健康检查**：`/health/live`（进程存活）与 `/health/ready`（依赖就绪，各 2s 超时）分离，容器探针语义正确。
 - **RBAC**：`roles / permissions / user_roles / role_permissions` 四表 + 种子角色（`admin` 旁路、`user`）；`@Roles` / `@Permissions` 声明式守卫，**每请求查库 → 角色/权限变更即时生效**（详见[RBAC 权限体系](#rbac-权限体系)）。
 - **CI**：GitHub Actions 6 项检查（见[运行测试](#运行测试)），含 Docker 镜像构建 + 生产配置 smoke。
+- **定时任务管理（若依式）**：任务定义存库（`job_definitions`）+ `SchedulerRegistry` 运行时动态调度 + 执行日志（`job_runs`）——管理端可 CRUD / 启停 / 手动执行，改 cron 热更新无需重启。种子 3 个清理任务（`cleanup:refresh-tokens` / `cleanup:audit-logs` / `cleanup:job-runs`）每日删除过期 refresh token（默认 30 天）、超保留期审计行与执行日志（login_logs / audit_logs / job_runs 默认 180 天，保留期可用 `CLEANUP_*` 环境变量调整），分批删除防长事务，阻止 append-only 表无界增长（见[定时任务管理](#定时任务管理)）。
 
 ## 技术栈
 
@@ -83,18 +84,28 @@ src/
 │   ├── exceptions/          # BusinessException（业务异常契约）
 │   ├── filters/             # AllExceptionsFilter（统一错误响应 + 可观测性补偿）
 │   ├── interceptors/        # TransformInterceptor（成功响应包装）
-│   ├── constants/           # rbac.constants（ADMIN_ROLE_CODE 系统角色码，与迁移种子强同步）
+│   ├── constants/           # rbac.constants（ADMIN_ROLE_CODE）/ audit.constants（AUDIT_ACTIONS）/ job.constants（JOB_ACTIONS + 动作码类型）
 │   └── decorators/          # rbac.decorator（@Roles/@Permissions + 元数据键，纯共享件）
 ├── config/                  # types（类型定义）/ env.validation（Joi 校验 + 安全策略）/ configuration（命名空间工厂）
 ├── database/                # database.module（运行时连接）/ data-source.ts（TypeORM CLI 迁移专用）
 ├── modules/
 │   ├── auth/                # 认证模块：User / RefreshToken 实体 + 注册/登录/刷新/登出/me（JWT + Cookie 双令牌）
 │   ├── rbac/                # RBAC 模块：实体 + RolesGuard + RbacService/RbacController（角色/权限管理端接口）
-│   └── users/               # 用户管理模块：/api/users 列表/创建/资料/状态/角色分配（用户资源上的管理操作）
+│   ├── users/               # 用户管理模块：/api/users 列表/创建/资料/状态/角色分配（用户资源上的管理操作）
+│   ├── sessions/            # 会话管理：在线列表 + 强制下线（单会话/全部）
+│   ├── audit/               # 审计：login_logs / audit_logs 两表 + 写入埋点 + 只读查询
+│   ├── jobs/                # 定时任务管理（若依式）：job_definitions/job_runs + 动态调度 + CRUD/启停/手动执行
+│   └── cleanup/             # 清理动作执行目标（cleanup:* 三个动作，由 jobs 模块调度触发）
 ├── redis/                   # redis.service（缓存门面）/ redis.module（客户端构建，超时选项纯函数）
 └── health/                  # health.controller（live/ready/check）+ health.module
 
-test/                        # 测试目录，结构与 src/ 对应（28 单测 suite + 8 e2e suite）
+test/                        # 测试目录，结构与 src/ 对应（31 单测 suite + 10 e2e suite）
+│   ├── e2e/                 # 真库端到端（10 个 *.e2e-spec.ts，由 jest-e2e.json 发现，--runInBand 串行）
+│   ├── app/                 # 应用装配单测（app.setup.spec，对应 src/app.setup.ts）
+│   ├── modules/             # 业务模块单测（镜像 src/modules/<module>/）
+│   ├── common/ config/      # 公共件 / 配置单测（镜像 src/common、src/config）
+│   ├── health/ redis/       # 健康检查 / Redis 单测（镜像 src/health、src/redis）
+│   └── jest-e2e.json        # e2e 的 jest 配置（rootDir=test/，递归匹配 .e2e-spec.ts）
 ```
 
 ## 快速开始
@@ -167,6 +178,8 @@ $ pnpm run format             # Prettier 格式化
 | `REDIS_COMMAND_TIMEOUT_MS` | `5000` | 单条命令超时（毫秒，`0=禁用`）；防依赖假死挂起调用方 |
 | `JWT_SECRET` | 无默认值（开发兜底示例值） | JWT 签名密钥，**>=16 字符**；生产必填（缺失启动失败）。首尾空白自动去除（Joi 校验与 `jwtConfig` 工厂同源 trim，避免"校验通过但签名用未 trim 值"）。生成：`node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"` |
 | `JWT_ACCESS_TTL_SECONDS` / `JWT_REFRESH_TTL_SECONDS` | `900` / `604800` | access token 有效期（秒，短 TTL 缩小泄露窗口）/ refresh token 有效期（秒，DB 存哈希，撤销即失效） |
+| `CLEANUP_REFRESH_TOKEN_RETENTION_DAYS` | `30` | refresh_tokens 保留天数：过期超过该天数的行由每日清理任务删除 |
+| `CLEANUP_AUDIT_RETENTION_DAYS` | `180` | 审计表保留天数：login_logs / audit_logs 超过该天数删除（审计合规要求通常更长，按需调大）；`cleanup:job-runs` 任务复用此值清理执行日志（见[定时任务管理](#定时任务管理)） |
 
 **迁移专项**（仅 CLI / 生产 migrate 服务读取，不进入应用运行时）：
 
@@ -187,13 +200,13 @@ $ pnpm run format             # Prettier 格式化
 
 ## 运行测试
 
-单元测试与 e2e 测试均位于 `test/` 目录，目录结构与 `src/` 对应。
+单元测试与 e2e 测试均位于 `test/` 目录，目录结构与 `src/` 对应：单测按 src 镜像（`modules/` `common/` `config/` `redis/` `health/` `app/`），e2e 统一收在 `test/e2e/`（由 `jest-e2e.json` 递归发现）。
 
 ```bash
-# 单元测试（28 suites · 309 tests）
+# 单元测试（31 suites · 348 tests）
 $ pnpm run test
 
-# e2e 测试（8 suites · 38 tests）——需要先 docker compose up -d 起依赖，
+# e2e 测试（10 suites · 48 tests）——需要先 docker compose up -d 起依赖，
 # 并对测试库执行迁移：pnpm run migration:run:test
 # 注意：test:e2e 固定 --runInBand 串行执行（suite 间共享同一测试库，
 # 并行时 8 个 app 实例并发写库会偶发瞬时超时/连接竞争导致 flaky 失败，串行消除）
@@ -323,6 +336,25 @@ adminOnly() { return { ok: true }; }
 - **尽力而为写入**：写入失败只记 warn、**绝不抛出**——登录已返回/管理操作已生效，审计是旁路，失败不得让主流程 500/回滚（与登录惰性清理同口径）；写入方在调用模块（auth 自持 LoginLog 仓库、经本模块 `recordLoginLog` 写入；users/rbac/sessions 经 AuditService），AuditModule 只读查询，避免 AuthModule↔AuditModule 循环依赖；登录日志不再经 AuditService（曾与 auth 各持一份重复实现、且测试覆盖的是不被调用的那份死代码，已删除）；
 - **查询层无需二次脱敏**：库中已是脱敏值；分页 pageSize 上限 100、page 上限 1_000_000（防 `(page-1)*pageSize` 溢出 bigint 触发 PG `22003` → 500）。
 
+定时任务管理（JobsModule，权限点 `job:read` / `job:create` / `job:update` / `job:delete` / `job:run`）：
+
+| 方法 | 路径 | 权限点 | 说明 |
+|---|---|---|---|
+| GET | `/api/jobs` | `job:read` | 任务定义分页（`page`/`pageSize`/`status` 筛选，按时间倒序） |
+| POST | `/api/jobs` | `job:create` | 创建任务（启用即热注册调度；cron 非法 400、重名 409） |
+| PATCH | `/api/jobs/:id` | `job:update` | 部分更新（cron 变更热更新调度） |
+| PATCH | `/api/jobs/:id/status` | `job:update` | 启停（enabled 注册 / disabled 停用，立即生效） |
+| POST | `/api/jobs/:id/run` | `job:run` | 手动执行一次（跳过 cron 等待，返回执行结果，HTTP 200） |
+| DELETE | `/api/jobs/:id` | `job:delete` | 删除任务（执行日志经 FK SET NULL 保留） |
+| GET | `/api/jobs/:id/runs` | `job:read` | 指定任务的执行日志分页（`status` 筛选） |
+
+设计要点：
+- **存库驱动 + 热更新**：任务定义存 `job_definitions`，启动时把 enabled 任务注册进 `SchedulerRegistry`；CRUD/启停/手动执行即时刷新调度，改配置无需重启（`@Cron` 静态装饰器的动态替代）；
+- **动作码 → 执行函数映射**：集中在 `JobService.actionRunners`，`JOB_ACTIONS`（`src/common/constants/job.constants.ts`）只登记清单避免 constants 反向依赖服务模块；新增动作 = 常量加一行 + 映射加一个函数；
+- **执行日志（job_runs）**：cron 触发与手动执行共用 `runAction` 写日志（成功/失败 + 时长 + 截断 500 的失败原因）；未知动作码（理论不可达）置 disabled 防重放；`job_id` SET NULL 外键（删任务保留日志）；只增不清，由 `cleanup:job-runs` 种子任务按保留期清理；
+- **容错**：cron 表达式非法（理论仅手改库出现）置 disabled 自我修复不拖垮启动；执行日志写入失败仅记 error；删除/注销调度均为尽力而为；多副本部署各副本各自注册执行（无分布式锁），cleanup 类动作幂等无害；
+  **新增非幂等动作前必须引入数据库 advisory lock / Redis 锁 / 单实例调度，否则多副本会重复执行**；
+
 要点：
 - **模块归属**：`/api/users*` 归 UsersModule（用户资源上的管理操作：列表/创建/资料/状态/角色分配），
   RbacModule 只管 `/roles`、`/permissions` 与角色-权限绑定；权限点常量仍在 `rbac.constants.ts`（代码侧唯一真源）；
@@ -383,7 +415,7 @@ docker/.env.prod      只给"生产 compose 插值"用，应用不读它；
 
 ### Migration 工作流
 
-仓库已有八个迁移（见 `src/database/migrations/`）：**`InitAuth`**（`users` + `refresh_tokens` 表）、**`InitRbac`**（`roles` / `permissions` / `user_roles` / `role_permissions` 四表 + 种子角色 `admin` / `user`，幂等插入）、**`InitRbacPermissions`**（管理端 7 个权限点种子：`role:read` / `role:create` / `role:update` / `role:delete` / `role:assign-permission` / `user:read` / `user:assign-role`，幂等插入）、**`InitUserPermissions`**（用户管理 3 个权限点：`user:create` / `user:update` / `user:disable`，幂等插入）与 **`InitSessionPermissions`**（会话管理 2 个权限点：`session:read` / `session:revoke`，幂等插入）、**`InitAudit`**（`login_logs` + `audit_logs` 两表及索引，`user_id` / `operator_id` 均 SET NULL 外键——用户删除后审计保留）、**`InitAuditPermissions`**（审计 1 个权限点：`audit:read`，幂等插入）与 **`InitPaginationIndexes`**（用户/在线会话列表的 `(created_at, id)` 稳定分页排序索引，幂等创建）。权限点合计 **13** 个；
+仓库已有十个迁移（见 `src/database/migrations/`）：**`InitAuth`**（`users` + `refresh_tokens` 表）、**`InitRbac`**（`roles` / `permissions` / `user_roles` / `role_permissions` 四表 + 种子角色 `admin` / `user`，幂等插入）、**`InitRbacPermissions`**（管理端 7 个权限点种子：`role:read` / `role:create` / `role:update` / `role:delete` / `role:assign-permission` / `user:read` / `user:assign-role`，幂等插入）、**`InitUserPermissions`**（用户管理 3 个权限点：`user:create` / `user:update` / `user:disable`，幂等插入）与 **`InitSessionPermissions`**（会话管理 2 个权限点：`session:read` / `session:revoke`，幂等插入）、**`InitAudit`**（`login_logs` + `audit_logs` 两表及索引，`user_id` / `operator_id` 均 SET NULL 外键——用户删除后审计保留）、**`InitAuditPermissions`**（审计 1 个权限点：`audit:read`，幂等插入）、**`InitPaginationIndexes`**（用户/在线会话列表的 `(created_at, id)` 稳定分页排序索引，幂等创建）、**`InitJobs`**（`job_definitions` + `job_runs` 两表及索引 + 种子 3 个清理任务，幂等插入）与 **`InitJobPermissions`**（定时任务 5 个权限点：`job:read` / `job:create` / `job:update` / `job:delete` / `job:run`，幂等插入）。权限点合计 **18** 个；
 用户名/邮箱/手机号的唯一性用**局部唯一索引**（`WHERE deleted_at IS NULL`，软删行不占用标识——注销后标识可重新注册）；
 `DB_SYNCHRONIZE` 已全面关闭（`.env` / `.env.test` / 生产均 `false`），schema 变更一律走迁移。新增/修改实体后：
 

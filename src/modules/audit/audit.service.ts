@@ -27,7 +27,7 @@ export interface ListAuditLogsQuery {
   action?: string;
   /** 按操作者过滤 */
   operatorId?: string;
-  /** 按资源类型过滤（user / role / session） */
+  /** 按资源类型过滤（user / role / session / job） */
   resourceType?: string;
 }
 

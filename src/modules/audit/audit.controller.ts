@@ -62,7 +62,8 @@ const AUDIT_LOG_ITEM_SCHEMA: SchemaObject = {
     },
     resourceType: {
       type: 'string',
-      description: '资源类型（user / role / session；permission 永不产生）',
+      description:
+        '资源类型（user / role / session / job；permission 永不产生）',
     },
     resourceId: { type: 'string', nullable: true, description: '资源 ID' },
     detail: {
@@ -155,7 +156,7 @@ export class AuditController {
   @ApiQuery({
     name: 'resourceType',
     required: false,
-    description: '按资源类型过滤（user/role/session）',
+    description: '按资源类型过滤（user/role/session/job）',
   })
   listLogs(@Query() query: ListAuditLogsQueryDto): Promise<AuditLogPage> {
     return this.auditService.listLogs(query);

@@ -5,13 +5,13 @@ import request from 'supertest';
 import { App } from 'supertest/types';
 import { Repository } from 'typeorm';
 
-import { AppModule } from '../src/app.module';
-import { configureApp } from '../src/app.setup';
-import { AuditLog } from '../src/modules/audit/entities/audit-log.entity';
-import { LoginLog } from '../src/modules/audit/entities/login-log.entity';
-import { User } from '../src/modules/auth/entities/user.entity';
-import { Role } from '../src/modules/rbac/entities/role.entity';
-import { UserRole } from '../src/modules/rbac/entities/user-role.entity';
+import { AppModule } from '../../src/app.module';
+import { configureApp } from '../../src/app.setup';
+import { AuditLog } from '../../src/modules/audit/entities/audit-log.entity';
+import { LoginLog } from '../../src/modules/audit/entities/login-log.entity';
+import { User } from '../../src/modules/auth/entities/user.entity';
+import { Role } from '../../src/modules/rbac/entities/role.entity';
+import { UserRole } from '../../src/modules/rbac/entities/user-role.entity';
 
 /**
  * 审计 e2e（真库）：依赖迁移已应用（InitAudit 建表 + InitAuditPermissions 登记 audit:read）。
@@ -228,5 +228,40 @@ describe('Audit (e2e)', () => {
       .expect(200);
     const listBody = list.body as { data: { items: unknown[]; total: number } };
     expect(listBody.data.total).toBeGreaterThanOrEqual(1);
+  });
+
+  it('job 资源审计可按 resourceType=job 过滤（DTO 白名单含 job）', async () => {
+    // P1 回归：白名单此前只有 user/role/session，resourceType=job 查询返回 400；
+    // 而 jobs 模块写审计用 resourceType='job'，导致任务审计永远无法按资源类型查到
+    const jobName = `audit-e2e-job-${suffix()}`;
+    await request(app.getHttpServer())
+      .post('/api/jobs')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({
+        name: jobName,
+        actionCode: 'cleanup:refresh-tokens',
+        cronExpression: '0 5 * * *',
+        remark: '审计 e2e 用任务',
+      })
+      .expect(201);
+
+    // 库直查确认落库为 resourceType='job'（detail.name 精确定位本次创建）
+    const rows = await auditLogs.find({
+      where: { action: 'job.create', operatorId: admin.userId },
+      order: { createdAt: 'DESC' },
+    });
+    const created = rows.find((r) => r.detail?.name === jobName);
+    expect(created).toBeDefined();
+    expect(created?.resourceType).toBe('job');
+
+    // HTTP 查询：resourceType=job 必须 200（而非 400）且命中
+    const list = await request(app.getHttpServer())
+      .get(
+        `/api/audit/logs?resourceType=job&action=job.create&operatorId=${admin.userId}`,
+      )
+      .set('Authorization', `Bearer ${admin.token}`)
+      .expect(200);
+    const body = list.body as { data: { items: unknown[]; total: number } };
+    expect(body.data.total).toBeGreaterThanOrEqual(1);
   });
 });

@@ -2,6 +2,7 @@ import { registerAs } from '@nestjs/config';
 
 import type {
   AppConfig,
+  CleanupConfig,
   CorsConfig,
   DatabaseConfig,
   DbLoggingOption,
@@ -76,6 +77,19 @@ export const throttlerConfig = registerAs('throttler', (): ThrottlerConfig => ({
 
 export const logConfig = registerAs('log', (): LogConfig => ({
   level: (process.env.LOG_LEVEL ?? 'info') as LogLevel,
+}));
+
+export const cleanupConfig = registerAs('cleanup', (): CleanupConfig => ({
+  // 保留天数默认值：refresh_tokens 30 天（过期行已无在线语义，保留期供审计追溯），
+  // 审计表 180 天（合规要求更长时可调）；env.validation.ts 已保证取值 >= 1
+  refreshTokenRetentionDays: parseInt(
+    process.env.CLEANUP_REFRESH_TOKEN_RETENTION_DAYS ?? '30',
+    10,
+  ),
+  auditRetentionDays: parseInt(
+    process.env.CLEANUP_AUDIT_RETENTION_DAYS ?? '180',
+    10,
+  ),
 }));
 
 export const jwtConfig = registerAs('jwt', (): JwtConfig => {

@@ -106,6 +106,14 @@ export const envValidationSchema = Joi.object({
     .max(PG_MS_GUC_MAX)
     .default(5000),
 
+  // ---------- 定时清理（cleanup 模块） ----------
+  // 保留天数下限 1：0 或负数会让每日任务立即清空全表（误配置保护）
+  CLEANUP_REFRESH_TOKEN_RETENTION_DAYS: Joi.number()
+    .integer()
+    .min(1)
+    .default(30),
+  CLEANUP_AUDIT_RETENTION_DAYS: Joi.number().integer().min(1).default(180),
+
   // ---------- JWT（认证模块） ----------
   // 签名密钥：故意不设默认值——开发环境由 jwtConfig 工厂兜底弱密钥（仅本地），
   // 生产强制显式配置（见 custom 安全策略 7），防止弱密钥静默上线

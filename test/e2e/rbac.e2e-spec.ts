@@ -6,16 +6,16 @@ import request from 'supertest';
 import { App } from 'supertest/types';
 import { Repository } from 'typeorm';
 
-import { AppModule } from '../src/app.module';
-import { configureApp } from '../src/app.setup';
-import { Permissions, Roles } from '../src/common/decorators/rbac.decorator';
-import { AuthModule } from '../src/modules/auth/auth.module';
-import { User } from '../src/modules/auth/entities/user.entity';
-import { JwtAuthGuard } from '../src/modules/auth/jwt-auth.guard';
-import { Role } from '../src/modules/rbac/entities/role.entity';
-import { UserRole } from '../src/modules/rbac/entities/user-role.entity';
-import { RbacModule } from '../src/modules/rbac/rbac.module';
-import { RolesGuard } from '../src/modules/rbac/roles.guard';
+import { AppModule } from '../../src/app.module';
+import { configureApp } from '../../src/app.setup';
+import { Permissions, Roles } from '../../src/common/decorators/rbac.decorator';
+import { AuthModule } from '../../src/modules/auth/auth.module';
+import { User } from '../../src/modules/auth/entities/user.entity';
+import { JwtAuthGuard } from '../../src/modules/auth/jwt-auth.guard';
+import { Role } from '../../src/modules/rbac/entities/role.entity';
+import { UserRole } from '../../src/modules/rbac/entities/user-role.entity';
+import { RbacModule } from '../../src/modules/rbac/rbac.module';
+import { RolesGuard } from '../../src/modules/rbac/roles.guard';
 
 /** 演示受保护接口：验证 @Roles/@Permissions 授权（真实守卫链路） */
 @Controller('_rbac-demo')

@@ -5,11 +5,11 @@ import request from 'supertest';
 import { App } from 'supertest/types';
 import { Repository } from 'typeorm';
 
-import { AppModule } from '../src/app.module';
-import { configureApp } from '../src/app.setup';
-import { User } from '../src/modules/auth/entities/user.entity';
-import { Role } from '../src/modules/rbac/entities/role.entity';
-import { UserRole } from '../src/modules/rbac/entities/user-role.entity';
+import { AppModule } from '../../src/app.module';
+import { configureApp } from '../../src/app.setup';
+import { User } from '../../src/modules/auth/entities/user.entity';
+import { Role } from '../../src/modules/rbac/entities/role.entity';
+import { UserRole } from '../../src/modules/rbac/entities/user-role.entity';
 
 /** 响应信封类型（只取用到的字段） */
 type Envelope<T> = { code: number; message: string; data: T };

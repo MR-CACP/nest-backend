@@ -84,6 +84,15 @@ export interface DatabaseConfig {
   statementTimeoutMs: number;
 }
 
+/** 定时清理配置（cleanup 命名空间）：每日任务删除过期/超保留期行，防无界增长 */
+export interface CleanupConfig {
+  /** refresh_tokens 保留天数：过期（expires_at）超过该天数的行才删除；
+   *  撤销行同样适用——保留期内撤销时间可审计，过期后无在线语义 */
+  refreshTokenRetentionDays: number;
+  /** 审计表保留天数：login_logs / audit_logs 超过该天数删除（审计合规要求通常更长） */
+  auditRetentionDays: number;
+}
+
 export interface RedisConfig {
   host: string;
   port: number;

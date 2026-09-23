@@ -84,6 +84,8 @@ describe('配置默认值对齐（Joi schema 与工厂函数）', () => {
       'REDIS_DB',
       'REDIS_KEY_PREFIX',
       'REDIS_COMMAND_TIMEOUT_MS',
+      'CLEANUP_REFRESH_TOKEN_RETENTION_DAYS',
+      'CLEANUP_AUDIT_RETENTION_DAYS',
     ];
 
     // 缺省路径：清空全部配置键，仅保留 NODE_ENV

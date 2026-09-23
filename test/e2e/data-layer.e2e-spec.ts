@@ -3,8 +3,8 @@ import { Test, TestingModule } from '@nestjs/testing';
 import request from 'supertest';
 import { App } from 'supertest/types';
 
-import { AppModule } from '../src/app.module';
-import { configureApp } from '../src/app.setup';
+import { AppModule } from '../../src/app.module';
+import { configureApp } from '../../src/app.setup';
 
 /** supertest 响应体统一收敛到该形态（与 TransformInterceptor/AllExceptionsFilter 对齐） */
 type Body = {

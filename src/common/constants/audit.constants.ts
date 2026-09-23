@@ -27,4 +27,14 @@ export const AUDIT_ACTIONS = {
   SESSION_REVOKE: 'session.revoke',
   /** 强制下线某用户全部会话 */
   SESSION_REVOKE_ALL: 'session.revoke_all',
+  /** 创建定时任务 */
+  JOB_CREATE: 'job.create',
+  /** 更新定时任务（cron/动作码/备注） */
+  JOB_UPDATE: 'job.update',
+  /** 启停定时任务 */
+  JOB_STATUS_UPDATE: 'job.status.update',
+  /** 手动执行一次定时任务 */
+  JOB_RUN: 'job.run',
+  /** 删除定时任务（执行日志经 FK SET NULL 保留） */
+  JOB_DELETE: 'job.delete',
 } as const;
